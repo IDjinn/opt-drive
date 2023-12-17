@@ -1,17 +1,24 @@
 mod wildcard;
 mod tests;
-
+use std::io::Write;
+use zip::write::FileOptions;
+use zip::ZipWriter;
 use std::io;
 use std::fs;
 use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
-use std::fs::{File, ReadDir};
+use std::fs::{File, Metadata, ReadDir};
 use std::hash::{Hash, Hasher};
+use std::iter::{Zip, zip};
 use std::path::{Path, PathBuf};
+use std::ptr::write_bytes;
 use std::time::Instant;
 use glob::{glob, MatchOptions};
 use rayon::iter::ParallelBridge;
 use rayon::prelude::*;
+use zip::CompressionMethod::Deflated;
+use serde::{Deserialize, Serialize};
+use serde::de::Unexpected::Option;
 use crate::wildcard::is_folder_path_regex_match;
 
 fn path_hash(path: &str) -> u64 {
@@ -21,10 +28,23 @@ fn path_hash(path: &str) -> u64 {
 }
 
 #[derive(Debug)]
-struct FileTree {
+enum MetaData {
+    File(FileMetadata),
+    Directory(DirectoryMetadata)
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct DirectoryMetadata {
     hash: u64,
     path: String,
     parent_hash: u64,
+}
+#[derive(Debug, Serialize, Deserialize)]
+struct FileMetadata {
+    hash: u64,
+    directory_hash: u64,
+    file_name: String,
+    file_extension_hash: u64,
 }
 
 struct Settings {
@@ -50,16 +70,20 @@ fn main() {
         include_extensions: vec![],
 
         exclude_paths: vec![".git",
+                            ".git.*",
                             "node_modules",
                             ".expo",
                             ".expo-shared",
                             ".fleet",
+                            ".vscode",
                             ".next",
                             ".idea",
                             ".gradle",
                             "build",
                             "__tests__",
-            ".*.json"
+            ".*.json",
+                            ".*.lock",
+                            ".*.toml",
         ],
         include_paths: vec!["C:\\dev\\react"],
 
@@ -68,23 +92,33 @@ fn main() {
     };
 
     let start_time = Instant::now();
-    let mut dict: HashMap<u64, FileTree> = HashMap::new();
+    let mut dict: HashMap<u64, MetaData> = HashMap::new();
     let files_tree = if settings.multi_thread_enabled {
-        let mut result:Vec<FileTree> = Vec::new();
+        let mut result:Vec<MetaData> = Vec::new();
         for include_path in &settings.include_paths {
             result.extend(read_recursive_parallel(include_path, &settings,settings.depth, 0)) ;
         }
         result
     } else  {
-        let mut result:Vec<FileTree> = Vec::new();
+        let mut result:Vec<MetaData> = Vec::new();
         for include_path in &settings.include_paths {
             result.extend(read_recursive(include_path, &settings,settings.depth, 0));
         }
         result
     };
     for fileTree in files_tree {
-        dict.insert(fileTree.hash, fileTree);
+        if let MetaData::Directory(directory) = fileTree{
+            dict.insert(directory.hash, MetaData::Directory(directory));
+            continue;
+        }
+
+        if let MetaData::File(file) = fileTree{
+            dict.insert(file.hash, MetaData::File(file));
+            continue;
+        }
     }
+
+
     let end_time = Instant::now();
     let elapsed_time = end_time - start_time;
     println!("Time spent: {:?}", elapsed_time);
@@ -92,7 +126,30 @@ fn main() {
     return;
 }
 
-fn read_recursive(path: &str, settings: &Settings, mut depth: i32, parent_hash: u64) -> Vec<FileTree> {
+
+fn file_metadata(path: &Path) -> std::option::Option<std::io::Result<Metadata>> {
+    let file = File::open(path);
+    if file.is_ok() {
+        return Some(file.unwrap().metadata());
+    }
+
+    return None;
+}
+
+//  fn save_file_tree(tree: &HashMap<u64, FileTree>){
+//     let path = Path::new("test.zip");
+//     let file = File::create(path).unwrap();
+//     let mut zip = ZipWriter::new(file);
+//     let options = FileOptions::default().compression_level(9).compression_method(Deflated);
+//
+//     for (key, value) in tree {
+//         zip.add_directory(key.to_string(), value.serialize().unwrap(), options);
+//     }
+//
+//     zip.add_directory("test/", Default::default());
+// }
+
+fn read_recursive(path: &str, settings: &Settings, mut depth: i32, parent_hash: u64) -> Vec<MetaData> {
     depth -= 1;
     if depth <= 0 {
         return Vec::new();
@@ -103,19 +160,39 @@ fn read_recursive(path: &str, settings: &Settings, mut depth: i32, parent_hash: 
         Err(_) => return Vec::new(),
     };
 
-    let mut result: Vec<FileTree> = Vec::new();
+    let mut result: Vec<MetaData> = Vec::new();
     for entry in paths {
         let entry_path = Path::new(&entry);
         if entry_path.is_dir() {
-            let entry_path_str = entry_path.to_string_lossy().to_string();
-            let hash = path_hash(&entry_path_str);
-            let tree = FileTree {
-                hash,
-                path: entry_path_str.clone(),
+            let directory_path = entry_path.to_string_lossy().to_string();
+            let directory_path_hash = path_hash(&directory_path);
+
+            result.push(MetaData::Directory(DirectoryMetadata {
+                hash: directory_path_hash,
+                path: directory_path.clone(),
                 parent_hash,
-            };
-            result.push(tree);
-            let sub_paths = read_recursive(&entry_path_str, &settings, depth, hash);
+            }));
+
+            let sub_paths = read_recursive(&directory_path, &settings, depth, directory_path_hash);
+            result.extend(sub_paths);
+        }
+        else{
+            let file = entry_path;
+            let file_path = file.to_string_lossy().to_string();
+            let file_name_hash = path_hash(&file_path);
+            let file_extension_hash = path_hash(file_path.split(".").last().unwrap_or_default());
+
+            let directory_path = file.parent().unwrap().to_string_lossy().to_string();
+            let directory_path_hash = path_hash(&directory_path);
+
+            result.push(MetaData::File(FileMetadata {
+                hash: file_name_hash,
+                file_name: file.file_name().unwrap().to_string_lossy().to_string(),
+                file_extension_hash,
+                directory_hash: directory_path_hash,
+            }));
+
+            let sub_paths = read_recursive(&file_path, &settings, depth, file_name_hash);
             result.extend(sub_paths);
         }
     }
@@ -123,7 +200,7 @@ fn read_recursive(path: &str, settings: &Settings, mut depth: i32, parent_hash: 
     result
 }
 
-fn read_recursive_parallel(path: &str, settings: &Settings, mut depth: i32, parent_hash: u64) -> Vec<FileTree> {
+fn read_recursive_parallel(path: &str, settings: &Settings, mut depth: i32, parent_hash: u64) -> Vec<MetaData> {
     if depth <= 0 {
         return Vec::new();
     }
@@ -134,24 +211,41 @@ fn read_recursive_parallel(path: &str, settings: &Settings, mut depth: i32, pare
         Err(_) => return Vec::new(),
     };
 
-    let result: Vec<FileTree> = paths
+    let result: Vec<MetaData> = paths
         .par_iter()
         .filter_map(|entry| {
-            let entry_path = Path::new(entry);
+            let entry_path = Path::new(&entry);
             if entry_path.is_dir() {
-                let entry_path_str = entry_path.to_string_lossy().to_string();
-                let hash = path_hash(&entry_path_str);
-                let tree = FileTree {
-                    hash,
-                    path: entry_path_str.clone(),
+                let directory_path = entry_path.to_string_lossy().to_string();
+                let directory_path_hash = path_hash(&directory_path);
+
+                let mut sub_paths = read_recursive(&directory_path, &settings, depth, directory_path_hash);
+                sub_paths.push(MetaData::Directory(DirectoryMetadata {
+                    hash: directory_path_hash,
+                    path: directory_path.clone(),
                     parent_hash,
-                };
-                let sub_paths = read_recursive_parallel(&entry_path_str, settings, depth, hash);
-                let mut result_vec = vec![tree];
-                result_vec.extend(sub_paths);
-                Some(result_vec)
-            } else {
-                None
+                }));
+
+                return Some(sub_paths)
+            }
+            else{
+                let file = entry_path;
+                let file_path = file.to_string_lossy().to_string();
+                let file_name_hash = path_hash(&file_path);
+                let file_extension_hash = path_hash(file_path.split(".").last().unwrap_or_default());
+
+                let directory_path = file.parent().unwrap().to_string_lossy().to_string();
+                let directory_path_hash = path_hash(&directory_path);
+
+                let mut sub_paths = read_recursive(&file_path, &settings, depth, file_name_hash);
+                sub_paths.push(MetaData::File(FileMetadata {
+                    hash: file_name_hash,
+                    file_name: file.file_name().unwrap().to_string_lossy().to_string(),
+                    file_extension_hash,
+                    directory_hash: directory_path_hash,
+                }));
+
+                return Some(sub_paths)
             }
         })
         .flatten()
@@ -187,6 +281,8 @@ fn is_path_valid(path: &Path, settings: &Settings) -> bool {
             println!("[skipped-ext] [exclude] path = {}", path_str);
             return false;
         }
+
+        return true;
     } else {
         if settings.include_paths.iter().any(|include_path| glob(include_path).ok().unwrap().any(|entry| entry.unwrap() == path)) {
             println!("[path-included] path = {}", path_str);
