@@ -1,0 +1,346 @@
+//! Camada de persistência do índice (SQLite via `rusqlite`).
+
+use std::path::Path;
+use std::sync::Mutex;
+
+use rusqlite::{params, Connection};
+
+use super::FileEntry;
+
+/// Wrapper thread-safe sobre a conexão SQLite. O daemon pode compartilhar uma
+/// instância entre tarefas concorrentes (index, queries de policy).
+pub struct IndexDb {
+    conn: Mutex<Connection>,
+}
+
+impl IndexDb {
+    pub fn open(path: &Path) -> anyhow::Result<Self> {
+        let conn = Connection::open(path)?;
+        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")?;
+        conn.execute_batch(SCHEMA)?;
+        Ok(Self {
+            conn: Mutex::new(conn),
+        })
+    }
+
+    /// Insere/atualiza uma entrada.
+    pub fn upsert(&self, e: &FileEntry) -> anyhow::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            SQL_UPSERT,
+            params![
+                e.path,
+                e.is_dir as i64,
+                e.size as i64,
+                e.mtime,
+                e.atime,
+                e.drive,
+                e.project_root,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Insere/atualiza várias entradas numa transação.
+    pub fn upsert_many(&self, entries: &[FileEntry]) -> anyhow::Result<usize> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let mut n = 0;
+        {
+            let mut stmt = tx.prepare_cached(SQL_UPSERT)?;
+            for e in entries {
+                stmt.execute(params![
+                    e.path,
+                    e.is_dir as i64,
+                    e.size as i64,
+                    e.mtime,
+                    e.atime,
+                    e.drive,
+                    e.project_root,
+                ])?;
+                n += 1;
+            }
+        }
+        tx.commit()?;
+        Ok(n)
+    }
+
+    /// Aplica um lote misto numa única transação: upserts de entradas novas/atualizadas
+    /// e remoções (cada remoção apaga o path e todos os descendentes). Usado pela
+    /// indexação incremental.
+    pub fn apply_mixed(
+        &self,
+        upserts: &[FileEntry],
+        removes: &[String],
+    ) -> anyhow::Result<()> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        {
+            let mut up = tx.prepare_cached(SQL_UPSERT)?;
+            for e in upserts {
+                up.execute(params![
+                    e.path,
+                    e.is_dir as i64,
+                    e.size as i64,
+                    e.mtime,
+                    e.atime,
+                    e.drive,
+                    e.project_root,
+                ])?;
+            }
+            let mut rm = tx.prepare_cached(SQL_DELETE_TREE)?;
+            for p in removes {
+                let pat = descendants_pattern(p);
+                rm.execute(params![p, pat])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Remove uma entrada e todos os descendentes indexados. Retorna o nº de linhas
+    /// apagadas. Retorna `Ok(0)` se o path não estava indexado.
+    pub fn remove_tree(&self, path: &str) -> anyhow::Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        let pat = descendants_pattern(path);
+        let n = conn.execute(SQL_DELETE_TREE, params![path, pat])?;
+        Ok(n)
+    }
+
+    /// Marca o horário desta indexação (usado p/ "stale" detection).
+    pub fn touch_indexed(&self) -> anyhow::Result<()> {
+        self.set_meta_u64("last_indexed", unix_now() as u64)
+    }
+
+    pub fn last_indexed(&self) -> Option<i64> {
+        self.get_meta_u64("last_indexed").map(|v| v as i64)
+    }
+
+    /// Estimativa do total de entradas (gravada ao fim de cada scan completo) — usada
+    /// para calcular a % e o ETA da próxima varredura.
+    pub fn set_scan_total(&self, total: usize) -> anyhow::Result<()> {
+        self.set_meta_u64("scan_total_estimate", total as u64)
+    }
+
+    pub fn scan_total_estimate(&self) -> Option<usize> {
+        self.get_meta_u64("scan_total_estimate").map(|v| v as usize)
+    }
+
+    /// Grava um valor inteiro numa chave da tabela `meta`.
+    fn set_meta_u64(&self, key: &str, v: u64) -> anyhow::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO meta(k,v) VALUES(?1, ?2)",
+            params![key, v as i64],
+        )?;
+        Ok(())
+    }
+
+    /// Lê um valor inteiro de uma chave da tabela `meta` (se existir).
+    fn get_meta_u64(&self, key: &str) -> Option<u64> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT v FROM meta WHERE k=?1",
+            params![key],
+            |r| r.get::<_, i64>(0),
+        )
+        .ok()
+        .map(|v| v as u64)
+    }
+
+    /// Total de entradas indexadas.
+    pub fn count(&self) -> usize {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row("SELECT COUNT(*) FROM files", [], |r| r.get::<_, i64>(0))
+            .unwrap_or(0) as usize
+    }
+
+    /// Carrega todas as entradas indexadas (para alimentar a policy engine).
+    pub fn list_all(&self) -> Vec<FileEntry> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = match conn.prepare(
+            "SELECT path, is_dir, size, mtime, atime, drive, project_root FROM files",
+        ) {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+        stmt.query_map([], row_to_entry)
+            .ok()
+            .into_iter()
+            .flatten()
+            .filter_map(Result::ok)
+            .collect()
+    }
+
+    /// Lista entradas por drive (ponto de montagem).
+    pub fn list_by_drive(&self, drive: &str) -> Vec<FileEntry> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT path, is_dir, size, mtime, atime, drive, project_root \
+                 FROM files WHERE drive = ?1 ORDER BY mtime ASC",
+            )
+            .unwrap();
+        stmt.query_map(params![drive], row_to_entry)
+            .ok()
+            .into_iter()
+            .flatten()
+            .filter_map(Result::ok)
+            .collect()
+    }
+
+    /// Lista os diretórios de projeto conhecidos (`project_root` distintos).
+    pub fn list_projects(&self) -> Vec<FileEntry> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT path, is_dir, size, mtime, atime, drive, project_root \
+                 FROM files WHERE is_dir = 1 AND project_root IS NOT NULL \
+                 GROUP BY project_root ORDER BY mtime ASC",
+            )
+            .unwrap();
+        stmt.query_map([], row_to_entry)
+            .ok()
+            .into_iter()
+            .flatten()
+            .filter_map(Result::ok)
+            .collect()
+    }
+
+    /// Soma o tamanho de todos os descendentes indexados de `path` (inclusive o próprio
+    /// dir, se houver linha). Retorna `None` quando nenhuma entrada casa — sinal de que
+    /// o diretório não foi indexado (quem chamou deve calcular ao vivo).
+    ///
+    /// O `LIKE` escapa `\`, `%` e `_` para não haver falsos positivos por causa de
+    /// caracteres curinga em nomes reais (ex.: `my_file`).
+    pub fn dir_size(&self, path: &str) -> Option<u64> {
+        let conn = self.conn.lock().unwrap();
+        let pattern = descendants_pattern(path);
+        let total: Option<i64> = conn
+            .query_row(
+                "SELECT SUM(size) FROM files WHERE path = ?1 OR path LIKE ?2 ESCAPE '\\'",
+                params![path, pattern],
+                |r| r.get::<_, Option<i64>>(0),
+            )
+            .ok()
+            .flatten();
+        total.map(|n| n.max(0) as u64)
+    }
+}
+
+fn row_to_entry(row: &rusqlite::Row<'_>) -> rusqlite::Result<FileEntry> {
+    Ok(FileEntry {
+        path: row.get(0)?,
+        is_dir: row.get::<_, i64>(1)? != 0,
+        size: row.get::<_, i64>(2)? as u64,
+        mtime: row.get(3)?,
+        atime: row.get(4)?,
+        drive: row.get(5)?,
+        project_root: row.get(6)?,
+    })
+}
+
+fn unix_now() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// Escapa `\`, `%` e `_` para uso num `LIKE … ESCAPE '\'`. Evita falsos positivos por
+/// causa de curingas em nomes reais (ex.: `my_file`, `data%`).
+fn escape_like(path: &str) -> String {
+    path.replace('\\', r"\\")
+        .replace('%', r"\%")
+        .replace('_', r"\_")
+}
+
+/// Pattern `LIKE` que casa `path` exato OU qualquer descendente
+/// (`path\...`). Usa `ESCAPE '\'` — o separador e as barras do próprio path são
+/// escapados por [`escape_like`].
+fn descendants_pattern(path: &str) -> String {
+    // separador (backslash escapado p/ LIKE) + curinga % (qualquer descendente).
+    format!("{}\\\\%", escape_like(path))
+}
+
+const SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS files (
+    path TEXT PRIMARY KEY,
+    is_dir INTEGER NOT NULL,
+    size INTEGER NOT NULL,
+    mtime INTEGER NOT NULL,
+    atime INTEGER NOT NULL,
+    drive TEXT NOT NULL,
+    project_root TEXT,
+    last_indexed INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_files_drive ON files(drive);
+CREATE INDEX IF NOT EXISTS idx_files_mtime ON files(mtime);
+CREATE INDEX IF NOT EXISTS idx_files_project ON files(project_root);
+CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v INTEGER);
+"#;
+
+const SQL_UPSERT: &str = r#"
+INSERT INTO files (path, is_dir, size, mtime, atime, drive, project_root, last_indexed)
+VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, strftime('%s','now'))
+ON CONFLICT(path) DO UPDATE SET
+    is_dir=excluded.is_dir,
+    size=excluded.size,
+    mtime=excluded.mtime,
+    atime=excluded.atime,
+    drive=excluded.drive,
+    project_root=excluded.project_root,
+    last_indexed=excluded.last_indexed
+"#;
+
+/// Apaga um path e seus descendentes. `?2` é um pattern `LIKE` com `ESCAPE '\'`
+/// (construído por [`descendants_pattern`]).
+const SQL_DELETE_TREE: &str = r#"DELETE FROM files WHERE path = ?1 OR path LIKE ?2 ESCAPE '\'"#;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    fn file(path: &str, size: u64) -> FileEntry {
+        FileEntry {
+            path: path.into(),
+            is_dir: false,
+            size,
+            mtime: 0,
+            atime: 0,
+            drive: "C:\\".into(),
+            project_root: None,
+        }
+    }
+
+    #[test]
+    fn dir_size_aggregates_descendants() {
+        let tmp = tempdir().unwrap();
+        let db = IndexDb::open(&tmp.path().join("idx.db")).unwrap();
+        db.upsert_many(&[
+            file("C:\\dev\\proj\\a.txt", 100),
+            file("C:\\dev\\proj\\sub\\b.txt", 250),
+            file("C:\\outro\\c.txt", 999),
+        ])
+        .unwrap();
+
+        assert_eq!(db.dir_size("C:\\dev\\proj"), Some(350));
+        assert_eq!(db.dir_size("C:\\dev"), Some(350));
+        // Não indexado → None.
+        assert_eq!(db.dir_size("C:\\naoexiste"), None);
+    }
+
+    #[test]
+    fn dir_size_escapes_underscore() {
+        let tmp = tempdir().unwrap();
+        let db = IndexDb::open(&tmp.path().join("idx.db")).unwrap();
+        db.upsert_many(&[
+            file("C:\\my_proj\\a.txt", 10),
+            file("C:\\myXproj\\b.txt", 9999), // não deve entrar no soma
+        ])
+        .unwrap();
+        assert_eq!(db.dir_size("C:\\my_proj"), Some(10));
+    }
+}

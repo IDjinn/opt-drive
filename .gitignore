@@ -1,0 +1,30 @@
+# Rust
+/target
+**/*.rs.bk
+Cargo.lock.bak
+
+# Tooling interno
+/.zcode/
+.idea/
+
+# Desktop (Node / Electron / Vite)
+/desktop/node_modules
+/desktop/dist
+/desktop/dist-renderer
+/desktop/out
+/desktop/.vite
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Daemon artifacts
+*.sqlite
+*.sqlite-journal
+*.tar.zst
+
+# Config / segredos locais
+config.local.toml
+*.secret
+.env
+.env.*
+token.json

@@ -1,0 +1,68 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/opt-drive-core",
+    "crates/opt-drive-daemon",
+    "crates/opt-drive-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+authors = ["opt-drive"]
+license = "MIT"
+publish = false
+
+# Dependências compartilhadas — referenciadas nos crates via `foo.workspace = true`.
+[workspace.dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+tokio-util = "0.7"
+futures = "0.3"
+
+# Daemon HTTP + WebSocket
+axum = { version = "0.7", features = ["ws"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors", "fs"] }
+
+# Serialização / config
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+# Erros / logging
+anyhow = "1"
+thiserror = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Tempo / IDs
+time = { version = "0.3", features = ["serde", "formatting", "parsing", "macros"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+
+# Filesystem / indexação
+ignore = "0.4"
+walkdir = "2"
+globset = "0.4"
+filetime = "0.2"
+notify = "7"
+notify-debouncer-mini = "0.5"
+rusqlite = { version = "0.32", features = ["bundled"] }
+directories = "5"
+
+# Compressão
+tar = "0.4"
+zstd = "0.13"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Interno
+opt-drive-core = { path = "crates/opt-drive-core" }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true
