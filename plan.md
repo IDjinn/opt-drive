@@ -162,48 +162,54 @@ Aba **🗂️ Indexação** no desktop (componente `Index.tsx` + wire no `App.ts
 
 ---
 
-## 3. Fase 2 — Backup / Sync Google Drive ⬜
+## 3. Fase 2 — Backup / Sync multi-conector + Encriptação ✅
 
-Objetivo: backup/sync incremental de pastas selecionadas, com restore.
+Objetivo: backup/sync incremental de pastas selecionadas, com restore, múltiplos
+conectores (local/S3/Google Drive) e encriptação opcional dos arquivos.
 
-### 3.1 Setup OAuth2 ⬜
-- [ ] Criar projeto no Google Cloud Console → OAuth client (Desktop app).
-- [ ] Baixar `credentials.json` (NÃO versionar — já no `.gitignore`).
-- [ ] Escolher crate: `google-drive3` (oficial-style) **ou** `drive-v3` + `oauth2`/`yup-oauth2`.
-  - Recomendação inicial: `drive-v3` (mais leve) + fluxo loopback OAuth2.
-- [ ] Implementar `providers/google_drive/auth.rs`: primeiro uso abre browser p/
-  consent → captura code via `localhost:<porta>` redirect → grava `token.json`
-  (refresh token persistente). Renovação automática via refresh.
+Arquitetura entregue:
 
-### 3.2 Implementar o provider ⬜
-- [ ] `providers/google_drive/mod.rs`: `GoogleDrive` implementando `BackupProvider`
-  (`authenticate`, `status`, `sync_dir`).
-- [ ] `status(local)`: consulta arquivo/pasta remoto por caminho (Drive API `files.list`
-  com `q: name=… and trashed=false`).
-- [ ] Hashing local: SHA-256 por arquivo (`sha2`) — base do sync incremental.
-- [ ] Manifest de sync: tabela `backup_state(path, sha256, mtime, remote_id)` no SQLite.
+- **Core** (`opt-drive-core`): trait `BackupProvider` + motor incremental
+  (`providers/sync.rs` — walk, SHA-256 por arquivo, manifest `backup_state` no
+  SQLite, só re-envia o que mudou), encriptação `ops/encrypt.rs` (ChaCha20-Poly1305
+  + Argon2, formato `.odenc`), config `[backup]`.
+- **Conectores** (`opt-drive-connectors`, crate novo — mantém o core sem rede):
+  - `local.rs` — mirror entre drives/pastas (sem rede).
+  - `s3.rs` — S3 e compatíveis (MinIO, R2, B2) via REST + SigV4 próprio (`sigv4.rs`).
+  - `google_drive.rs` — OAuth2 loopback (browser + `localhost:<porta>/callback`),
+    token persistente em `google_token.json`, renovação via refresh, Drive v3 REST.
+  - Factory `connector_from_config` por string `connector`.
+- **Daemon**: `POST /api/backup/run` (run_lock + spawn_blocking + WS
+  `backup_started/progress/done`), `GET /api/backup/status`, `POST /api/backup/restore`,
+  scheduler de backup (`schedule_secs > 0`).
+- **CLI**: `backup run|status|restore <remote_id> <dst>`, `encrypt`/`decrypt`
+  (dry-run default, `--apply`).
+- **UI**: aba ☁️ Backup (status do conector, "Executar agora" com progresso WS).
 
-### 3.3 Sync incremental ⬜
-- [ ] Walk local (reusar `index::walker` c/ regras de cleanup p/ excluir junk).
-- [ ] Comparar com `backup_state`: upload se hash mudou ou é novo.
-- [ ] Upload **resumível** (Drive API multipart/resumable) p/ arquivos grandes.
-- [ ] Dedup/pasta-app: usar uma pasta raiz `Opt-Drive/` no Drive do usuário.
-- [ ] Políticas de exclusão remota: `--delete` opcional (default OFF — seguro).
+### 3.x Config de backup
+```toml
+[backup]
+connector = "s3"          # "local" | "s3" | "google-drive"
+paths = ["C:\\dev"]
+schedule_secs = 0         # 0 = só manual
+delete_remote = false
+encrypt = true
 
-### 3.4 Integração ⬜
-- [ ] Config: seção `[backup]` (`provider = "google-drive"`, `paths = [...]`,
-  `schedule`, `delete_remote = false`).
-- [ ] Daemon scheduler: job periódico de backup (em janela configurada).
-- [ ] API: `POST /api/backup/run`, `GET /api/backup/status`, eventos WS
-  (`backup_progress`, `backup_done`).
-- [ ] CLI: `opt-drive backup run` / `opt-drive backup status` / `opt-drive backup restore <id>`.
-- [ ] UI: aba **Backup** (status, últimas execuções, botão "sincronizar agora").
+[backup.options]          # por conector:
+bucket = "my-backups"     #   s3: bucket, region, endpoint, (ou env AWS_*)
+region = "us-east-1"
+#   local: target_root = "D:\\Backup"
+#   google-drive: credentials_path = "C:\\secrets\\client_secret.json"
 
-### 3.5 Critério de pronto da Fase 2
-- [ ] OAuth 1ª vez funciona; token persiste entre reinícios.
-- [ ] Alterar um arquivo local e rodar sync → só ele é re-enviado.
-- [ ] Restore de um arquivo via CLI.
-- [ ] Estado de sync sobrevive a re-indexação.
+[backup.encryption]
+passphrase_env = "OPT_DRIVE_PASSPHRASE"   # passphrase NUNCA fica na config
+```
+
+### Próximos passos do backup
+- [ ] Upload resumível p/ arquivos grandes (hoje multipart/PUT único).
+- [ ] `--delete` remoto real (flag já existe no motor; UI/CLI não expõem listagem).
+- [ ] Testes de integração S3 contra MinIO local (`#[ignore]`).
+- [ ] Rename/move detection (Drive `files.update addParents`).
 
 ---
 
@@ -226,8 +232,12 @@ Objetivo: backup/sync incremental de pastas selecionadas, com restore.
 - [ ] Quotas: limitar quanto do drive lento/rápido o tiering pode ocupar.
 
 ### 4.4 Mais providers de backup
-- [ ] OneDrive (Graph API), Dropbox, S3/REST genérico — todos via `BackupProvider`.
-- [ ] Backup local (espelhamento entre drives, sem nuvem).
+- [x] S3/compatíveis (MinIO, R2, B2) via SigV4 próprio. ✅
+- [x] Google Drive (OAuth2 loopback + Drive v3). ✅
+- [x] Backup local (espelhamento entre drives, sem nuvem). ✅
+- [x] Encriptação de arquivos (`.odenc`, ChaCha20-Poly1305 + Argon2) no pipeline
+  de backup e via CLI (`opt-drive encrypt/decrypt`). ✅
+- [ ] OneDrive (Graph API), Dropbox — todos via `BackupProvider`.
 
 ### 4.5 UX
 - [ ] Gráficos de uso de espaço/histórico (recharts).
@@ -256,13 +266,13 @@ Objetivo: backup/sync incremental de pastas selecionadas, com restore.
 
 ### Comandos úteis
 ```bash
-cargo test                              # 19 testes unitários
+cargo test                              # 44 testes unitários
 cargo clippy --all-targets             # deve estar sem warnings
 cargo run -p opt-drive-cli -- drives   # valida detecção de drives
 cd desktop && npm run dev              # app completo (electron + daemon)
 ```
 
-### Decisões pendentes (a decidir ao iniciar a Fase 2)
-- `google-drive3` vs `drive-v3` (avaliar ergonomia de tipos e manutenção).
-- Estratégia de rename/move detection no sync (Drive `files.update` com `addParents`).
-- Política padrão de retenção/exclusão remota.
+### Decisões resolvidas (Fase 2)
+- SDK do Drive descartado: OAuth2 + Drive v3 REST direto via `reqwest` blocking.
+- S3 sem SDK oficial: SigV4 implementado em `opt-drive-connectors/src/sigv4.rs`.
+- Rede fora do core: crate `opt-drive-connectors` (invariante 5 preservada).

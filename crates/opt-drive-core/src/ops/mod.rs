@@ -6,6 +6,7 @@
 
 pub mod cleanup;
 pub mod compress;
+pub mod encrypt;
 pub mod journal;
 pub mod relocate;
 

@@ -1,5 +1,15 @@
 // Cliente da API do daemon (REST + WebSocket).
-import type { CleanupTarget, Config, DirEntry, Drive, IndexStatus, Plan, RunReport } from './types';
+import type {
+  BackupStatus,
+  CleanupTarget,
+  Config,
+  DirEntry,
+  Drive,
+  IndexStatus,
+  Plan,
+  RunReport,
+  SyncReport,
+} from './types';
 
 declare global {
   interface Window {
@@ -51,6 +61,13 @@ export const api = {
   tierPreview: () => req<Plan>('/api/tier/preview'),
   tierApply: () =>
     req<{ report: RunReport; journal: string }>('/api/tier/apply', { method: 'POST' }),
+  backupStatus: () => req<BackupStatus>('/api/backup/status'),
+  backupRun: () => req<SyncReport>('/api/backup/run', { method: 'POST' }),
+  backupRestore: (remoteId: string, dst: string) =>
+    req<{ restored: boolean; dst: string }>('/api/backup/restore', {
+      method: 'POST',
+      body: JSON.stringify({ remote_id: remoteId, dst }),
+    }),
 };
 
 /** Abre o WebSocket de eventos e chama `onEvent` para cada mensagem. */

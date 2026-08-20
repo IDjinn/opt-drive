@@ -25,10 +25,12 @@ crates/
       index/{mod,db,walker}.rs #   varredura + SQLite
       usage/mod.rs             #   score de atividade (mtime + git commit)
       policy/mod.rs            #   engine de regras → Plan de Actions
-      ops/{mod,relocate,cleanup,compress,journal}.rs  # execução c/ undo
-      providers/mod.rs         #   trait BackupProvider (+ google_drive stub)
-  opt-drive-daemon/            # axum REST + WS + scheduler; usa core
-  opt-drive-cli/               # clap; usa core
+      ops/{mod,relocate,cleanup,compress,encrypt,journal}.rs  # execução c/ undo
+      providers/{mod,sync}.rs #   trait BackupProvider + motor incremental (SHA-256)
+  opt-drive-connectors/        # conectores de backup (rede vive AQUI, não no core)
+    src/{local,s3,sigv4,google_drive}.rs
+  opt-drive-daemon/            # axum REST + WS + scheduler; usa core + connectors
+  opt-drive-cli/               # clap; usa core + connectors
 desktop/                       # Electron (electron/main.js, preload.js) + React (src/)
 ```
 
@@ -86,8 +88,12 @@ Em `cli/src/main.rs`: adicione variante em `Cmd` (clap derive), despache em `mai
 reaproveite `core`. Mantenha saída legível (use `fmt_bytes`).
 
 ### Um provider de backup
-Implemente `providers::BackupProvider` (`name`, `authenticate`, `status`, `sync_dir`).
-Veja `providers/mod.rs` e o stub `google_drive`. Depois conecte à config/scheduler/API.
+No crate `opt-drive-connectors`: implemente `providers::sync::Transport` (`upload`,
+`download`, `exists`, `delete`) — o motor incremental (`core::providers::sync`) faz o
+resto (walk, SHA-256, manifest `backup_state`, encriptação opcional). Registre na
+factory `connector_from_config` (`lib.rs`) e adicione um teste com tempdir (veja
+`local.rs` como referência). A passphrase de encriptação SEMPRE vem de variável de
+ambiente (`BackupConfig::passphrase`), nunca da config.
 
 ### Uma tela de UI
 Em `desktop/src/components/`: crie o componente, adicione aba em `App.tsx`, consuma
@@ -96,7 +102,7 @@ Em `desktop/src/components/`: crie o componente, adicione aba em `App.tsx`, cons
 ## Testes & qualidade
 
 ```bash
-cargo test                         # deve passar (atualmente 11 testes)
+cargo test                         # deve passar (atualmente 44 testes)
 cargo clippy --all-targets         # deve estar SEM warnings
 cd desktop && npx tsc --noEmit     # renderer deve tipar
 ```

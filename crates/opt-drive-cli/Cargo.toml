@@ -13,6 +13,8 @@ path = "src/main.rs"
 
 [dependencies]
 opt-drive-core = { workspace = true }
+opt-drive-connectors = { path = "../opt-drive-connectors" }
+walkdir = { workspace = true }
 tokio = { workspace = true }
 clap = { workspace = true }
 serde = { workspace = true }

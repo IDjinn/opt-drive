@@ -38,6 +38,9 @@ pub fn router(state: AppState) -> Router {
         .route("/api/tier/preview", get(tier_preview))
         .route("/api/tier/apply", post(tier_apply))
         .route("/api/journals", get(list_journals))
+        .route("/api/backup/run", post(backup_run))
+        .route("/api/backup/status", get(backup_status))
+        .route("/api/backup/restore", post(backup_restore))
         .route("/api/events", get(events_ws))
         .layer(cors)
         .with_state(state)
@@ -279,6 +282,131 @@ async fn tier_apply(State(st): State<AppState>) -> R<RunReport> {
 
     st.emit(Event::TierDone { report: report.clone() });
     Ok(Json(report))
+}
+
+/// Executa o backup configurado em `[backup]` (sync incremental de todos os
+/// caminhos). Segue o padrão do tier_apply: `run_lock` + `spawn_blocking` +
+/// eventos WS.
+async fn backup_run(State(st): State<AppState>) -> R<opt_drive_core::providers::SyncReport> {
+    let cfg = st.load_config()?;
+    if !cfg.backup.enabled() {
+        return Err(AppError::msg(
+            StatusCode::BAD_REQUEST,
+            "backup não configurado: defina [backup] connector e paths",
+        ));
+    }
+    // Passphrase antes de travar (nunca logar o valor).
+    let passphrase = if cfg.backup.encrypt {
+        Some(cfg.backup.passphrase()?)
+    } else {
+        None
+    };
+
+    let _lock = st.run_lock.clone().lock_owned().await;
+    st.emit(Event::BackupStarted {
+        connector: cfg.backup.connector.clone(),
+        paths: cfg.backup.paths.len(),
+    });
+
+    let st2 = st.clone();
+    let backup = cfg.backup.clone();
+    let report = spawn_blocking(move || -> anyhow::Result<opt_drive_core::providers::SyncReport> {
+        let provider = opt_drive_connectors::connector_from_config(&backup)?;
+        let db = IndexDb::open(&st2.db_path)?;
+        let events = st2.events.clone();
+
+        let mut total = opt_drive_core::providers::SyncReport::default();
+        for path in &backup.paths {
+            let ctx = opt_drive_core::providers::sync::SyncContext {
+                db: &db,
+                delete_remote: backup.delete_remote,
+                passphrase: passphrase.as_deref(),
+                progress: &|current, frac| {
+                    let _ = events.send(Event::BackupProgress {
+                        current: current.to_string(),
+                        frac,
+                    });
+                },
+            };
+            let r = provider.sync_dir(path, &ctx)?;
+            total.uploaded += r.uploaded;
+            total.skipped += r.skipped;
+            total.failed += r.failed;
+            total.bytes_transferred += r.bytes_transferred;
+        }
+        Ok(total)
+    })
+    .await?;
+
+    st.emit(Event::BackupDone {
+        report: report.clone(),
+        errors: report.failed as usize,
+    });
+    Ok(Json(report))
+}
+
+/// Estado do backup: config resumida + nº de itens no manifest.
+async fn backup_status(State(st): State<AppState>) -> R<serde_json::Value> {
+    let cfg = st.load_config()?;
+    let db_path = st.db_path.clone();
+    let entries = spawn_blocking(move || -> anyhow::Result<i64> {
+        let db = IndexDb::open(&db_path)?;
+        let n = db.backup_state_count();
+        Ok(n)
+    })
+    .await?;
+    Ok(Json(json!({
+        "enabled": cfg.backup.enabled(),
+        "connector": cfg.backup.connector,
+        "paths": cfg.backup.paths,
+        "encrypt": cfg.backup.encrypt,
+        "delete_remote": cfg.backup.delete_remote,
+        "schedule_secs": cfg.backup.schedule_secs,
+        "entries": entries,
+    })))
+}
+
+#[derive(serde::Deserialize)]
+struct RestoreBody {
+    /// Identificador no destino (coluna `remote_id` do `backup_state`).
+    remote_id: String,
+    /// Caminho local de destino do arquivo restaurado.
+    dst: String,
+}
+
+async fn backup_restore(
+    State(st): State<AppState>,
+    Json(body): Json<RestoreBody>,
+) -> R<serde_json::Value> {
+    let cfg = st.load_config()?;
+    if !cfg.backup.enabled() {
+        return Err(AppError::msg(
+            StatusCode::BAD_REQUEST,
+            "backup não configurado: defina [backup] connector e paths",
+        ));
+    }
+    let passphrase = if cfg.backup.encrypt {
+        Some(cfg.backup.passphrase()?)
+    } else {
+        None
+    };
+
+    let backup = cfg.backup.clone();
+    let dst = PathBuf::from(&body.dst);
+    let remote_id = body.remote_id.clone();
+    spawn_blocking(move || -> anyhow::Result<()> {
+        let provider = opt_drive_connectors::connector_from_config(&backup)?;
+        let db = IndexDb::open(&st.db_path)?;
+        let ctx = opt_drive_core::providers::sync::SyncContext {
+            db: &db,
+            delete_remote: false,
+            passphrase: passphrase.as_deref(),
+            progress: &|_, _| {},
+        };
+        provider.restore(&remote_id, &dst, &ctx)
+    })
+    .await?;
+    Ok(Json(json!({ "restored": true, "dst": body.dst })))
 }
 
 async fn list_journals(State(_st): State<AppState>) -> R<serde_json::Value> {

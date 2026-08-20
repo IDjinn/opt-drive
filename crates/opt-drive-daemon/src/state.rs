@@ -38,6 +38,12 @@ pub enum Event {
     TierStarted,
     TierProgress { desc: String, frac: f64 },
     TierDone { report: RunReport },
+    /// Backup iniciado (conector nome + nº de caminhos configurados).
+    BackupStarted { connector: String, paths: usize },
+    /// Progresso do backup (arquivo atual + fração 0..1).
+    BackupProgress { current: String, frac: f64 },
+    /// Backup concluído (relatório consolidado de todos os caminhos).
+    BackupDone { report: opt_drive_core::providers::SyncReport, errors: usize },
 }
 
 #[derive(Debug, Clone, Serialize)]

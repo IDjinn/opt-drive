@@ -4,6 +4,7 @@ use std::path::Path;
 use std::sync::Mutex;
 
 use rusqlite::{params, Connection};
+use serde::{Deserialize, Serialize};
 
 use super::FileEntry;
 
@@ -207,6 +208,48 @@ impl IndexDb {
             .collect()
     }
 
+    /// Insere/atualiza o estado de backup de um arquivo (pós-upload).
+    pub fn upsert_backup_entry(&self, e: &BackupEntry) -> anyhow::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO backup_state(path, sha256, size, mtime, remote_id, encrypted, synced_at) \
+             VALUES(?1,?2,?3,?4,?5,?6,?7) \
+             ON CONFLICT(path) DO UPDATE SET \
+             sha256=excluded.sha256, size=excluded.size, mtime=excluded.mtime, \
+             remote_id=excluded.remote_id, encrypted=excluded.encrypted, \
+             synced_at=excluded.synced_at",
+            params![
+                e.path,
+                e.sha256,
+                e.size as i64,
+                e.mtime,
+                e.remote_id,
+                e.encrypted as i64,
+                e.synced_at
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Recupera o último estado de backup de um arquivo (se já foi enviado).
+    pub fn get_backup_entry(&self, path: &str) -> Option<BackupEntry> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT path, sha256, size, mtime, remote_id, encrypted, synced_at \
+             FROM backup_state WHERE path = ?1",
+            params![path],
+            row_to_backup_entry,
+        )
+        .ok()
+    }
+
+    /// Total de itens no manifest de backup.
+    pub fn backup_state_count(&self) -> i64 {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row("SELECT COUNT(*) FROM backup_state", [], |r| r.get(0))
+            .unwrap_or(0)
+    }
+
     /// Soma o tamanho de todos os descendentes indexados de `path` (inclusive o próprio
     /// dir, se houver linha). Retorna `None` quando nenhuma entrada casa — sinal de que
     /// o diretório não foi indexado (quem chamou deve calcular ao vivo).
@@ -228,8 +271,35 @@ impl IndexDb {
     }
 }
 
-fn row_to_entry(row: &rusqlite::Row<'_>) -> rusqlite::Result<FileEntry> {
-    Ok(FileEntry {
+/// Estado de backup de um arquivo (linha da tabela `backup_state`). Serve de
+/// manifest incremental: se `sha256`/`mtime` batem, o arquivo não é re-enviado.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BackupEntry {
+    pub path: String,
+    /// SHA-256 do conteúdo **efetivamente enviado** (após encriptação, se houver,
+    /// usa-se o hash do plaintext para detecção de mudança).
+    pub sha256: String,
+    pub size: u64,
+    pub mtime: i64,
+    /// Identificador no destino (chave S3, file id do Drive, caminho no mirror).
+    pub remote_id: String,
+    pub encrypted: bool,
+    pub synced_at: i64,
+}
+
+fn row_to_backup_entry(row: &rusqlite::Row<'_>) -> rusqlite::Result<BackupEntry> {
+    Ok(BackupEntry {
+        path: row.get(0)?,
+        sha256: row.get(1)?,
+        size: row.get::<_, i64>(2)?.max(0) as u64,
+        mtime: row.get(3)?,
+        remote_id: row.get(4)?,
+        encrypted: row.get::<_, i64>(5)? != 0,
+        synced_at: row.get(6)?,
+    })
+}
+
+fn row_to_entry(row: &rusqlite::Row<'_>) -> rusqlite::Result<FileEntry> {    Ok(FileEntry {
         path: row.get(0)?,
         is_dir: row.get::<_, i64>(1)? != 0,
         size: row.get::<_, i64>(2)? as u64,
@@ -279,6 +349,16 @@ CREATE INDEX IF NOT EXISTS idx_files_drive ON files(drive);
 CREATE INDEX IF NOT EXISTS idx_files_mtime ON files(mtime);
 CREATE INDEX IF NOT EXISTS idx_files_project ON files(project_root);
 CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v INTEGER);
+CREATE TABLE IF NOT EXISTS backup_state (
+    path TEXT PRIMARY KEY,
+    sha256 TEXT NOT NULL,
+    size INTEGER NOT NULL,
+    mtime INTEGER NOT NULL,
+    remote_id TEXT NOT NULL,
+    encrypted INTEGER NOT NULL DEFAULT 0,
+    synced_at INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_backup_synced ON backup_state(synced_at);
 "#;
 
 const SQL_UPSERT: &str = r#"
@@ -342,5 +422,39 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(db.dir_size("C:\\my_proj"), Some(10));
+    }
+
+    #[test]
+    fn backup_state_upsert_and_get() {
+        let tmp = tempdir().unwrap();
+        let db = IndexDb::open(&tmp.path().join("idx.db")).unwrap();
+        assert!(db.get_backup_entry("C:\\dev\\a.txt").is_none());
+
+        db.upsert_backup_entry(&BackupEntry {
+            path: "C:\\dev\\a.txt".into(),
+            sha256: "abc".into(),
+            size: 10,
+            mtime: 123,
+            remote_id: "s3://bucket/dev/a.txt".into(),
+            encrypted: true,
+            synced_at: 1,
+        })
+        .unwrap();
+        // Upsert atualiza o mesmo path em vez de duplicar.
+        db.upsert_backup_entry(&BackupEntry {
+            path: "C:\\dev\\a.txt".into(),
+            sha256: "def".into(),
+            size: 20,
+            mtime: 456,
+            remote_id: "s3://bucket/dev/a.txt".into(),
+            encrypted: true,
+            synced_at: 2,
+        })
+        .unwrap();
+
+        let e = db.get_backup_entry("C:\\dev\\a.txt").unwrap();
+        assert_eq!(e.sha256, "def");
+        assert_eq!(e.size, 20);
+        assert!(e.encrypted);
     }
 }

@@ -25,12 +25,14 @@ rusqlite = { workspace = true }
 directories = { workspace = true }
 tar = { workspace = true }
 zstd = { workspace = true }
+sha2 = { workspace = true }
+chacha20poly1305 = { workspace = true }
+argon2 = { workspace = true }
+rand = { workspace = true }
+tempfile = "3"
 
 # Detecção de drives no Windows: Win32 para espaço/rótulo, PowerShell para BusType/MediaType
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = [
     "Win32_Storage_FileSystem",
 ] }
-
-[dev-dependencies]
-tempfile = "3"

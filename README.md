@@ -4,8 +4,9 @@ Intelligent file and backup management across multiple drives.
 
 Automatically moves inactive projects/files from the fast (NVMe) SSD to the slower
 SSD/HDD, cleans regenerable dependencies (`node_modules`, `target`, …) during
-tiering, compresses whatever is being archived, and (in phase 2) performs
-backup/sync with Google Drive.
+tiering, compresses whatever is being archived, and performs **encrypted
+incremental backups** to local mirrors, S3 (and S3-compatible: MinIO, R2, B2) or
+Google Drive.
 
 > 📄 **Docs**: [`plan.md`](./plan.md) (step-by-step roadmap) ·
 > [`AGENTS.md`](./AGENTS.md) (contribution guide / agents).
@@ -22,7 +23,8 @@ opt-drive-cli (bin) ─────────────────► opt-d
 
 | Crate / app | Role |
 |---|---|
-| `crates/opt-drive-core` | All the logic: drive detection, indexing (SQLite), tiering rules, operations (move+junction, cleanup, compression), backup provider trait. |
+| `crates/opt-drive-core` | All the logic: drive detection, indexing (SQLite), tiering rules, operations (move+junction, cleanup, compression), backup sync engine, encryption (`.odenc`). |
+| `crates/opt-drive-connectors` | Backup connectors (network lives here, not in core): local mirror, S3 (own SigV4 signing), Google Drive (OAuth2 loopback). |
 | `crates/opt-drive-daemon` | Resident service: scheduler + REST/WebSocket API on `127.0.0.1` (ephemeral port). |
 | `crates/opt-drive-cli` | Command line (`opt-drive`) for automation/manual use. |
 | `desktop/` | Electron + React app (UI). Spawns the daemon as a sidecar and discovers the port via stdout. |
@@ -105,6 +107,11 @@ cargo run -p opt-drive-cli -- status        # index stats
 cargo run -p opt-drive-cli -- tier          # tiering PREVIEW (dry-run)
 cargo run -p opt-drive-cli -- tier --apply  # run the tiering
 cargo run -p opt-drive-cli -- config show
+cargo run -p opt-drive-cli -- backup run      # incremental backup (configured connector)
+cargo run -p opt-drive-cli -- backup status
+cargo run -p opt-drive-cli -- backup restore <remote_id> <dst>
+cargo run -p opt-drive-cli -- encrypt <path> --apply   # local .odenc encryption (dry-run by default)
+cargo run -p opt-drive-cli -- decrypt <path> --apply
 ```
 
 ### Daemon (directly)
@@ -132,8 +139,9 @@ npm run dev     # vite + electron; electron spawns the daemon (target/debug)
 - `GET /api/browse?path=<abs>` — lists directories/files with size (hybrid explorer)
 - `GET /api/cleanup/catalog` — cleanup catalog (builtin + custom) for the UI
 - `GET /api/tier/preview` · `POST /api/tier/apply`
+- `POST /api/backup/run` · `GET /api/backup/status` · `POST /api/backup/restore`
 - `GET /api/journals`
-- `WS /api/events` — live scan/tiering progress + `index_updated` (watcher increment)
+- `WS /api/events` — live scan/tiering/backup progress + `index_updated` (watcher increment)
 
 ## Configuration (`config.toml`)
 
@@ -166,6 +174,22 @@ from_tier = "fast"
 to_tier = "slow"
 cleanup_deps = true
 junction = true
+
+[backup]
+connector = "s3"            # "local" | "s3" | "google-drive"
+paths = ["C:\\dev"]
+schedule_secs = 0           # 0 = manual only
+delete_remote = false
+encrypt = true              # encrypt files before upload (ChaCha20-Poly1305)
+
+[backup.options]            # connector-specific:
+bucket = "my-backups"       #   s3: bucket, region, endpoint (MinIO/R2/B2);
+region = "us-east-1"        #   credentials from AWS_ACCESS_KEY_ID/SECRET or here
+#   local: target_root = "D:\\Backup"
+#   google-drive: credentials_path = "C:\\secrets\\client_secret.json"
+
+[backup.encryption]
+passphrase_env = "OPT_DRIVE_PASSPHRASE"   # passphrase NEVER stored in config
 ```
 
 ## Status
@@ -177,5 +201,10 @@ junction = true
 - [x] **Real-time indexing**: `notify` file watcher applies incremental changes to
   the index (create/modify/remove) without a full re-scan — the explorer and
   tiering stay always up to date.
-- [ ] **Phase 2 — backup / Google Drive**: `BackupProvider` (OAuth, incremental sync).
-- [ ] **Phase 3 — polish**: polished UI, more providers, auto-start, guided restore.
+- [x] **Phase 2 — backup / multi-connector**: incremental sync with SHA-256
+  manifest (`backup_state`) via `BackupProvider` — local mirror, S3-compatible
+  (own SigV4, no AWS SDK), Google Drive (OAuth2 loopback + Drive v3 REST) —
+  scheduler job, REST/WS API, CLI and UI. Optional **client-side encryption**
+  (`.odenc`, ChaCha20-Poly1305 + Argon2, passphrase via env var) applied both to
+  backups and to standalone local files (`opt-drive encrypt/decrypt`).
+- [ ] **Phase 3 — polish**: polished UI, more providers (OneDrive, Dropbox), auto-start, guided restore.

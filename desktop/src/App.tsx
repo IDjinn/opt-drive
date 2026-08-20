@@ -6,8 +6,9 @@ import Drives from './components/Drives';
 import Index from './components/Index';
 import Tiering from './components/Tiering';
 import Rules from './components/Rules';
+import Backup from './components/Backup';
 
-type Tab = 'drives' | 'index' | 'tiering' | 'rules';
+type Tab = 'drives' | 'index' | 'tiering' | 'rules' | 'backup';
 
 /** Resumo curto da varredura p/ o sidebar (ex.: "Indexando… 73% · 12k entradas · ETA 2m"). */
 function scanSummary(p: ScanProgress): string {
@@ -111,6 +112,17 @@ export default function App() {
           setLiveActivity(null);
           setRefreshKey((k) => k + 1);
           break;
+        case 'backup_started':
+          setLiveActivity(`Backup [${ev.connector}] iniciado…`);
+          break;
+        case 'backup_progress':
+          setLiveActivity(
+            ev.current ? `Backup ${(ev.frac * 100).toFixed(0)}% — ${ev.current}` : 'Backup…',
+          );
+          break;
+        case 'backup_done':
+          setLiveActivity(null);
+          break;
         default:
           break;
       }
@@ -141,6 +153,9 @@ export default function App() {
           </button>
           <button className={tab === 'rules' ? 'active' : ''} onClick={() => setTab('rules')}>
             ⚙️ Regras
+          </button>
+          <button className={tab === 'backup' ? 'active' : ''} onClick={() => setTab('backup')}>
+            ☁️ Backup
           </button>
         </nav>
         <div className="status-card">
@@ -180,6 +195,7 @@ export default function App() {
             {t === 'index' && <Index scanning={scanning} scan={scan} refreshKey={refreshKey} />}
             {t === 'tiering' && <Tiering refreshKey={refreshKey} />}
             {t === 'rules' && <Rules />}
+            {t === 'backup' && <Backup />}
           </div>
         ))}
       </main>

@@ -75,6 +75,37 @@ export interface Config {
   rules: Rule[];
   /** Opcional: daemons antigos não têm esta seção no /api/config. */
   indexer?: IndexerConfig;
+  backup?: BackupConfig;
+}
+
+/// Backup/sync para conectores (local, s3, google-drive).
+export interface BackupConfig {
+  connector: string;
+  paths: string[];
+  schedule_secs: number;
+  delete_remote: boolean;
+  encrypt: boolean;
+  options: Record<string, string>;
+  encryption: { passphrase_env: string };
+}
+
+/// Status do backup (GET /api/backup/status).
+export interface BackupStatus {
+  enabled: boolean;
+  connector: string;
+  paths: string[];
+  encrypt: boolean;
+  delete_remote: boolean;
+  schedule_secs: number;
+  entries: number;
+}
+
+/// Relatório de um sync incremental.
+export interface SyncReport {
+  uploaded: number;
+  skipped: number;
+  failed: number;
+  bytes_transferred: number;
 }
 
 /// Ajustes do motor de indexação (paralelismo / uso de CPU).
@@ -147,4 +178,7 @@ export type DaemonEvent =
   | { type: 'tier_preview'; plan: Plan }
   | { type: 'tier_started' }
   | { type: 'tier_progress'; desc: string; frac: number }
-  | { type: 'tier_done'; report: RunReport };
+  | { type: 'tier_done'; report: RunReport }
+  | { type: 'backup_started'; connector: string; paths: number }
+  | { type: 'backup_progress'; current: string; frac: number }
+  | { type: 'backup_done'; report: SyncReport; errors: number };

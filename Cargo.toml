@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/opt-drive-core",
+    "crates/opt-drive-connectors",
     "crates/opt-drive-daemon",
     "crates/opt-drive-cli",
 ]
@@ -55,11 +56,22 @@ directories = "5"
 tar = "0.4"
 zstd = "0.13"
 
+# Cripto / integridade (backup + encriptação de arquivos)
+sha2 = "0.10"
+chacha20poly1305 = "0.10"
+argon2 = "0.5"
+rand = "0.8"
+
+# Conectores de backup
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+base64 = "0.22"
+
 # CLI
 clap = { version = "4", features = ["derive"] }
 
 # Interno
 opt-drive-core = { path = "crates/opt-drive-core" }
+opt-drive-connectors = { path = "crates/opt-drive-connectors" }
 
 [profile.release]
 opt-level = 3

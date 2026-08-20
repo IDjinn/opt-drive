@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use crate::cleanup_catalog::{CleanupRules, CleanupTarget};
 use crate::drives::mount_of;
 
-pub use db::IndexDb;
+pub use db::{BackupEntry, IndexDb};
 pub use watch::{ChangeBatch, ChangeStats, FsChange, FsChangeKind};
 
 /// Uma entrada indexada (arquivo ou diretório).

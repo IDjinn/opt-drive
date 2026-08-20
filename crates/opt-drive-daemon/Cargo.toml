@@ -9,6 +9,7 @@ publish.workspace = true
 
 [dependencies]
 opt-drive-core = { workspace = true }
+opt-drive-connectors = { path = "../opt-drive-connectors" }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 futures = { workspace = true }

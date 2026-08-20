@@ -57,6 +57,116 @@ pub struct Config {
     /// Ajustes do motor de indexação (paralelismo, uso de CPU).
     #[serde(default)]
     pub indexer: IndexerConfig,
+
+    /// Backup/sync para conectores remotos (S3, Google Drive) ou local.
+    #[serde(default)]
+    pub backup: BackupConfig,
+}
+
+/// Configuração de backup/sync (Fase 2). `connector` seleciona o backend:
+/// `"s3"`, `"google-drive"` ou `"local"` (espelhamento entre drives).
+///
+/// ```toml
+/// [backup]
+/// connector = "s3"
+/// paths = ["C:\\dev"]
+/// schedule_secs = 0
+/// delete_remote = false
+/// encrypt = false
+///
+/// [backup.options]
+/// bucket = "my-backups"
+/// region = "us-east-1"
+///
+/// [backup.encryption]
+/// passphrase_env = "OPT_DRIVE_PASSPHRASE"
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BackupConfig {
+    /// Conector a usar: `"s3"`, `"google-drive"` ou `"local"`. Vazio = backup
+    /// desabilitado.
+    #[serde(default)]
+    pub connector: String,
+    /// Diretórios a sincronizar.
+    #[serde(default)]
+    pub paths: Vec<PathBuf>,
+    /// Intervalo do job automático no scheduler (0 = só manual). Default: 0.
+    #[serde(default)]
+    pub schedule_secs: u64,
+    /// Apaga no destino o que não existe mais localmente. Default: `false`
+    /// (conservador — nunca destrói backup por engano).
+    #[serde(default)]
+    pub delete_remote: bool,
+    /// Encripta arquivos antes do upload (ChaCha20-Poly1305, ver
+    /// [`crate::ops::encrypt`]). Default: `false`.
+    #[serde(default)]
+    pub encrypt: bool,
+    /// Opções específicas do conector (chave → valor). Ex.: `bucket`/`region`/
+    /// `endpoint` (s3), `credentials_path` (google-drive), `target_root` (local).
+    #[serde(default)]
+    pub options: std::collections::BTreeMap<String, String>,
+    /// Derivação de chave quando `encrypt = true`.
+    #[serde(default)]
+    pub encryption: EncryptionConfig,
+}
+
+/// Onde ler a passphrase de encriptação. A passphrase em si **nunca** fica na
+/// config — apenas o nome da variável de ambiente que a contém.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EncryptionConfig {
+    /// Nome da variável de ambiente com a passphrase. Default:
+    /// `OPT_DRIVE_PASSPHRASE`.
+    #[serde(default = "default_passphrase_env")]
+    pub passphrase_env: String,
+}
+
+// `Default` manual (não derivável) porque o campo tem default não-vazio.
+#[allow(clippy::derivable_impls)]
+impl Default for EncryptionConfig {
+    fn default() -> Self {
+        Self {
+            passphrase_env: default_passphrase_env(),
+        }
+    }
+}
+
+fn default_passphrase_env() -> String {
+    "OPT_DRIVE_PASSPHRASE".into()
+}
+
+// Manual (não derivável) porque `connector` default é relevante semanticamente
+// via `EncryptionConfig`, mantendo o restante idêntico ao derive.
+#[allow(clippy::derivable_impls)]
+impl Default for BackupConfig {
+    fn default() -> Self {
+        Self {
+            connector: String::new(),
+            paths: Vec::new(),
+            schedule_secs: 0,
+            delete_remote: false,
+            encrypt: false,
+            options: std::collections::BTreeMap::new(),
+            encryption: EncryptionConfig::default(),
+        }
+    }
+}
+
+impl BackupConfig {
+    /// Backup habilitado (conector definido e ao menos um caminho).
+    pub fn enabled(&self) -> bool {
+        !self.connector.is_empty() && !self.paths.is_empty()
+    }
+
+    /// Lê a passphrase da variável de ambiente configurada.
+    pub fn passphrase(&self) -> anyhow::Result<String> {
+        match std::env::var(&self.encryption.passphrase_env) {
+            Ok(p) if !p.is_empty() => Ok(p),
+            _ => anyhow::bail!(
+                "variável de ambiente {} não definida (necessária para encriptação de backup)",
+                self.encryption.passphrase_env
+            ),
+        }
+    }
 }
 
 /// Configuração do motor de indexação (varredura completa).
@@ -305,5 +415,39 @@ paths = []
         let back: Config = toml::from_str(&s).unwrap();
         assert_eq!(back.indexer.threads, 4);
         assert_eq!(back.indexer.effective_threads(), 4);
+    }
+
+    #[test]
+    fn backup_defaults_and_round_trips() {
+        // Sem [backup] → desabilitado, com defaults seguros.
+        let cfg: Config = toml::from_str("").unwrap();
+        assert!(!cfg.backup.enabled());
+        assert_eq!(cfg.backup.encryption.passphrase_env, "OPT_DRIVE_PASSPHRASE");
+
+        // Round-trip completo com conector + opções + encriptação.
+        let cfg = Config {
+            backup: BackupConfig {
+                connector: "s3".into(),
+                paths: vec!["C:\\dev".into()],
+                schedule_secs: 3600,
+                delete_remote: false,
+                encrypt: true,
+                options: [
+                    ("bucket".to_string(), "my-backups".to_string()),
+                    ("region".to_string(), "us-east-1".to_string()),
+                ]
+                .into_iter()
+                .collect(),
+                encryption: EncryptionConfig::default(),
+            },
+            ..Default::default()
+        };
+        let s = toml::to_string_pretty(&cfg).unwrap();
+        let back: Config = toml::from_str(&s).unwrap();
+        assert!(back.backup.enabled());
+        assert_eq!(back.backup.connector, "s3");
+        assert_eq!(back.backup.schedule_secs, 3600);
+        assert!(back.backup.encrypt);
+        assert_eq!(back.backup.options.get("bucket").unwrap(), "my-backups");
     }
 }

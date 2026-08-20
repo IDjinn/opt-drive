@@ -1,0 +1,23 @@
+[package]
+name = "opt-drive-connectors"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+opt-drive-core = { workspace = true }
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+sha2 = { workspace = true }
+hmac = "0.12"
+reqwest = { workspace = true }
+base64 = { workspace = true }
+tempfile = "3"
+
+[dev-dependencies]
+rusqlite = { workspace = true }

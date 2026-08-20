@@ -79,6 +79,9 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
+    // Scheduler de backup: roda quando [backup].schedule_secs > 0.
+    tokio::spawn(backup_scheduler(state.clone()));
+
     // Bind efêmero.
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", args.port)).await?;
     let local = listener.local_addr()?;
@@ -139,6 +142,92 @@ async fn scheduler(state: AppState, interval: Duration) {
                 Ok(())
             })
             .await;
+        }
+    }
+}
+
+/// Loop do scheduler de backup: checa a cada minuto se `schedule_secs` venceu
+/// e, se o daemon estiver ocioso, executa o sync incremental.
+async fn backup_scheduler(state: AppState) {
+    let mut last_run = std::time::Instant::now();
+    let mut ticker = tokio::time::interval(Duration::from_secs(60));
+    ticker.tick().await; // primeiro tick imediato
+    loop {
+        ticker.tick().await;
+        let cfg = match state.load_config() {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        let every = Duration::from_secs(cfg.backup.schedule_secs);
+        if !cfg.backup.enabled() || every.is_zero() || last_run.elapsed() < every {
+            continue;
+        }
+        // Só roda se não houver outra tarefa pesada em andamento.
+        if let Ok(_guard) = state.run_lock.clone().try_lock_owned() {
+            last_run = std::time::Instant::now();
+            // Passphrase pode não estar definida (daemon headless) — falha e loga.
+            let passphrase = if cfg.backup.encrypt {
+                match cfg.backup.passphrase() {
+                    Ok(p) => Some(p),
+                    Err(e) => {
+                        tracing::warn!(target: "opt-drive.backup", error = %e, "backup agendado ignorado");
+                        continue;
+                    }
+                }
+            } else {
+                None
+            };
+            state.emit(state::Event::BackupStarted {
+                connector: cfg.backup.connector.clone(),
+                paths: cfg.backup.paths.len(),
+            });
+            let events = state.events.clone();
+            let backup = cfg.backup.clone();
+            let db_path = state.db_path.clone();
+            let res = tokio::task::spawn_blocking(
+                move || -> anyhow::Result<opt_drive_core::providers::SyncReport> {
+                    let provider = opt_drive_connectors::connector_from_config(&backup)?;
+                    let db = opt_drive_core::index::IndexDb::open(&db_path)?;
+                    let mut total = opt_drive_core::providers::SyncReport::default();
+                    for path in &backup.paths {
+                        let ctx = opt_drive_core::providers::sync::SyncContext {
+                            db: &db,
+                            delete_remote: backup.delete_remote,
+                            passphrase: passphrase.as_deref(),
+                            progress: &|current, frac| {
+                                let _ = events.send(state::Event::BackupProgress {
+                                    current: current.to_string(),
+                                    frac,
+                                });
+                            },
+                        };
+                        let r = provider.sync_dir(path, &ctx)?;
+                        total.uploaded += r.uploaded;
+                        total.skipped += r.skipped;
+                        total.failed += r.failed;
+                        total.bytes_transferred += r.bytes_transferred;
+                    }
+                    Ok(total)
+                },
+            )
+            .await;
+            match res {
+                Ok(Ok(report)) => {
+                    tracing::info!(target: "opt-drive.backup",
+                        uploaded = report.uploaded, skipped = report.skipped,
+                        failed = report.failed, "backup agendado concluído");
+                    state.emit(state::Event::BackupDone {
+                        report,
+                        errors: 0,
+                    });
+                }
+                Ok(Err(e)) => {
+                    tracing::error!(target: "opt-drive.backup", error = %e, "backup agendado falhou")
+                }
+                Err(e) => {
+                    tracing::error!(target: "opt-drive.backup", error = %e, "join do backup falhou")
+                }
+            }
         }
     }
 }

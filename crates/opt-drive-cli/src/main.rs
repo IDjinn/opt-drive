@@ -61,6 +61,43 @@ enum Cmd {
         #[command(subcommand)]
         action: ConfigCmd,
     },
+    /// Backup/sync via conector configurado em `[backup]` (local, s3, google-drive).
+    Backup {
+        #[command(subcommand)]
+        action: BackupCmd,
+    },
+    /// Encripta arquivo(s) locais para `.odenc` (ChaCha20-Poly1305).
+    Encrypt {
+        /// Arquivo ou diretório a encriptar.
+        path: PathBuf,
+        /// Executa de fato (default = apenas lista o que seria feito).
+        #[arg(long)]
+        apply: bool,
+        /// Variável de ambiente com a passphrase (default OPT_DRIVE_PASSPHRASE).
+        #[arg(long)]
+        passphrase_env: Option<String>,
+    },
+    /// Decripta arquivo(s) `.odenc`.
+    Decrypt {
+        /// Arquivo ou diretório a decriptar.
+        path: PathBuf,
+        /// Executa de fato (default = apenas lista o que seria feito).
+        #[arg(long)]
+        apply: bool,
+        /// Variável de ambiente com a passphrase (default OPT_DRIVE_PASSPHRASE).
+        #[arg(long)]
+        passphrase_env: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum BackupCmd {
+    /// Executa o sync incremental agora.
+    Run,
+    /// Mostra estado do backup (config + manifest).
+    Status,
+    /// Restaura um item: `opt-drive backup restore <remote_id> <dst>`.
+    Restore { remote_id: String, dst: PathBuf },
 }
 
 #[derive(Subcommand)]
@@ -100,6 +137,19 @@ fn main() -> anyhow::Result<()> {
             ConfigCmd::Show => cmd_config_show(&config_path),
             ConfigCmd::Edit => cmd_config_edit(&config_path),
         },
+        Cmd::Backup { action } => match action {
+            BackupCmd::Run => cmd_backup_run(&config_path, &db_path),
+            BackupCmd::Status => cmd_backup_status(&config_path, &db_path),
+            BackupCmd::Restore { remote_id, dst } => {
+                cmd_backup_restore(&config_path, &db_path, &remote_id, &dst)
+            }
+        },
+        Cmd::Encrypt { path, apply, passphrase_env } => {
+            cmd_crypt(&path, apply, passphrase_env, true)
+        }
+        Cmd::Decrypt { path, apply, passphrase_env } => {
+            cmd_crypt(&path, apply, passphrase_env, false)
+        }
     }
 }
 
@@ -323,8 +373,186 @@ fn cmd_config_edit(config_path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn cmd_backup_run(config_path: &Path, db_path: &Path) -> anyhow::Result<()> {
+    let cfg = load_config(config_path)?;
+    if !cfg.backup.enabled() {
+        println!("Backup não configurado — defina [backup] connector e paths em:");
+        println!("  {}", config_path.display());
+        return Ok(());
+    }
+    let passphrase = if cfg.backup.encrypt {
+        Some(cfg.backup.passphrase()?)
+    } else {
+        None
+    };
+
+    let provider = opt_drive_connectors::connector_from_config(&cfg.backup)?;
+    let db = IndexDb::open(db_path)?;
+    let pb = indicatif::ProgressBar::new_spinner();
+    pb.set_style(
+        indicatif::ProgressStyle::with_template("{spinner:.green} {elapsed_precise} {msg}").unwrap(),
+    );
+    pb.enable_steady_tick(std::time::Duration::from_millis(80));
+    pb.set_message("backup…");
+
+    let mut total = opt_drive_core::providers::SyncReport::default();
+    for path in &cfg.backup.paths {
+        let ctx = opt_drive_core::providers::sync::SyncContext {
+            db: &db,
+            delete_remote: cfg.backup.delete_remote,
+            passphrase: passphrase.as_deref(),
+            progress: &|current, frac| {
+                if !current.is_empty() {
+                    pb.set_message(format!("{:.0}% {current}", frac * 100.0));
+                }
+            },
+        };
+        let r = provider.sync_dir(path, &ctx)?;
+        total.uploaded += r.uploaded;
+        total.skipped += r.skipped;
+        total.failed += r.failed;
+        total.bytes_transferred += r.bytes_transferred;
+    }
+
+    pb.finish_with_message(format!(
+        "✓ [{}] {} enviados, {} intactos, {} falhas, {}",
+        provider.name(),
+        total.uploaded,
+        total.skipped,
+        total.failed,
+        format_bytes(total.bytes_transferred),
+    ));
+    Ok(())
+}
+
+fn cmd_backup_status(config_path: &Path, db_path: &Path) -> anyhow::Result<()> {
+    let cfg = load_config(config_path)?;
+    println!("Backup:   {}", if cfg.backup.enabled() { "ativado" } else { "desativado" });
+    println!("Conector: {}", cfg.backup.connector);
+    println!("Caminhos: {:?}", cfg.backup.paths);
+    println!("Encriptado: {}", cfg.backup.encrypt);
+    println!("Delete remoto: {}", cfg.backup.delete_remote);
+    if cfg.backup.schedule_secs > 0 {
+        println!("Agenda: a cada {}s", cfg.backup.schedule_secs);
+    }
+    let db = IndexDb::open(db_path)?;
+    println!("Manifest: {} itens sincronizados", db.backup_state_count());
+    Ok(())
+}
+
+fn cmd_backup_restore(
+    config_path: &Path,
+    db_path: &Path,
+    remote_id: &str,
+    dst: &Path,
+) -> anyhow::Result<()> {
+    let cfg = load_config(config_path)?;
+    if !cfg.backup.enabled() {
+        anyhow::bail!("backup não configurado");
+    }
+    let passphrase = if cfg.backup.encrypt {
+        Some(cfg.backup.passphrase()?)
+    } else {
+        None
+    };
+    let provider = opt_drive_connectors::connector_from_config(&cfg.backup)?;
+    let db = IndexDb::open(db_path)?;
+    let ctx = opt_drive_core::providers::sync::SyncContext {
+        db: &db,
+        delete_remote: false,
+        passphrase: passphrase.as_deref(),
+        progress: &|_, _| {},
+    };
+    provider.restore(remote_id, dst, &ctx)?;
+    println!("✓ restaurado: {} → {}", remote_id, dst.display());
+    Ok(())
+}
+
+/// Encripta/decripta arquivos locais. Diretórios são percorridos recursivamente;
+/// cada `<arquivo>` vira `<arquivo>.odenc` (encrypt) ou volta ao nome original
+/// (decrypt, a partir de `.odenc`). Dry-run por padrão (invariante 1).
+fn cmd_crypt(
+    path: &Path,
+    apply: bool,
+    passphrase_env: Option<String>,
+    encrypt: bool,
+) -> anyhow::Result<()> {
+    let env_name = passphrase_env.unwrap_or_else(|| "OPT_DRIVE_PASSPHRASE".into());
+    let passphrase = std::env::var(&env_name).map_err(|_| {
+        anyhow::anyhow!("defina a passphrase na variável de ambiente {env_name}")
+    })?;
+
+    // Coleta os pares (origem, destino).
+    let mut pairs: Vec<(PathBuf, PathBuf)> = Vec::new();
+    if path.is_dir() {
+        for e in walkdir::WalkDir::new(path).follow_links(false) {
+            let e = e?;
+            if !e.file_type().is_file() {
+                continue;
+            }
+            let p = e.path();
+            if encrypt {
+                if p.extension().and_then(|x| x.to_str()) == Some("odenc") {
+                    continue; // já encriptado
+                }
+                pairs.push((p.to_path_buf(), append_odenc(p)));
+            } else if p.extension().and_then(|x| x.to_str()) == Some("odenc") {
+                pairs.push((p.to_path_buf(), strip_odenc(p)));
+            }
+        }
+    } else if encrypt {
+        pairs.push((path.to_path_buf(), append_odenc(path)));
+    } else {
+        pairs.push((path.to_path_buf(), strip_odenc(path)));
+    }
+
+    if pairs.is_empty() {
+        println!("Nada a {}.", if encrypt { "encriptar" } else { "decriptar" });
+        return Ok(());
+    }
+
+    let verb = if encrypt { "encriptar" } else { "decriptar" };
+    println!(
+        "\n{} {} CRIPTOGRAFIA — {} arquivo(s)\n",
+        if apply { "▶ APLICAR" } else { "👁 PREVIEW" },
+        verb.to_uppercase(),
+        pairs.len()
+    );
+    for (src, dst) in &pairs {
+        println!("  {} → {}", src.display(), dst.display());
+    }
+    if !apply {
+        println!("\n(preview) Para executar: opt-drive {} <path> --apply", verb);
+        return Ok(());
+    }
+
+    for (src, dst) in &pairs {
+        if encrypt {
+            opt_drive_core::ops::encrypt::encrypt_file(src, dst, &passphrase)?;
+            std::fs::remove_file(src)?;
+        } else {
+            opt_drive_core::ops::encrypt::decrypt_file(src, dst, &passphrase)?;
+            std::fs::remove_file(src)?;
+        }
+    }
+    println!("✓ {} arquivo(s) processado(s).", pairs.len());
+    Ok(())
+}
+
 // --- helpers ------------------------------------------------------------------
 
+/// `a.txt` → `a.txt.odenc`
+fn append_odenc(p: &Path) -> PathBuf {
+    let mut s = p.as_os_str().to_os_string();
+    s.push(".odenc");
+    PathBuf::from(s)
+}
+
+/// `a.txt.odenc` → `a.txt`
+fn strip_odenc(p: &Path) -> PathBuf {
+    let name = p.to_string_lossy();
+    PathBuf::from(name.strip_suffix(".odenc").unwrap_or(&name))
+}
 fn format_bytes(b: u64) -> String {
     const KB: u64 = 1024;
     const MB: u64 = KB * 1024;
