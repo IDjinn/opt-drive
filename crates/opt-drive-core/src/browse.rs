@@ -11,7 +11,7 @@
 //! … travam por minutos). O fluxo correto é indexar primeiro (com progresso visível) e
 //! então navegar.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 
@@ -28,6 +28,25 @@ pub struct DirEntry {
     /// Para pastas: o tamanho veio do índice (`true`) ou é desconhecido (`false`)?
     /// Para arquivos sempre `false` (tamanho veio do metadata ao vivo).
     pub indexed: bool,
+    /// Entrada especial (sistema, cloud-sync, junction) que o opt-drive nunca
+    /// modifica — a UI marca com 🔒.
+    pub protected: bool,
+}
+
+/// Remove o prefixo verbatim que `canonicalize()` retorna no Windows:
+/// `\\?\C:\dev` → `C:\dev` e `\\?\UNC\srv\share` → `\\srv\share`.
+///
+/// As chaves do índice são gravadas pelo walker no formato plain (vêm direto de
+/// `watch.paths`), então sem esta normalização o lookup de `dir_size` nunca bate.
+pub fn normalize_verbatim(p: &Path) -> PathBuf {
+    let s = p.to_string_lossy();
+    if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+        return PathBuf::from(format!(r"\\{}", rest));
+    }
+    if let Some(rest) = s.strip_prefix(r"\\?\") {
+        return PathBuf::from(rest.to_string());
+    }
+    p.to_path_buf()
 }
 
 /// Lista os filhos de `path`, ordenando diretórios antes de arquivos (alfabético,
@@ -50,6 +69,12 @@ pub fn list_dir(path: &Path, db: Option<&IndexDb>) -> anyhow::Result<Vec<DirEntr
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
 
+        // file_type (sem seguir links) detecta junctions/symlinks — metadados
+        // seguidos não distinguem um link do alvo.
+        let is_reparse = child.file_type().map(|ft| ft.is_symlink()).unwrap_or(false);
+        let protected =
+            is_reparse || crate::protected::is_protected(&child.path()).is_some();
+
         let is_dir = meta.is_dir();
         let (size_bytes, indexed) = if is_dir {
             // Tamanho só do índice; se não houver, fica desconhecido (0 + indexed=false).
@@ -68,6 +93,7 @@ pub fn list_dir(path: &Path, db: Option<&IndexDb>) -> anyhow::Result<Vec<DirEntr
             size_bytes,
             mtime,
             indexed,
+            protected,
         });
     }
 
@@ -145,6 +171,24 @@ mod tests {
         assert!(dir.is_dir);
         assert_eq!(dir.size_bytes, 0);
         assert!(!dir.indexed);
+    }
+
+    #[test]
+    fn normalize_verbatim_strips_prefixes() {
+        use super::normalize_verbatim;
+        assert_eq!(
+            normalize_verbatim(Path::new(r"\\?\C:\dev\proj")),
+            PathBuf::from(r"C:\dev\proj")
+        );
+        assert_eq!(
+            normalize_verbatim(Path::new(r"\\?\UNC\server\share")),
+            PathBuf::from(r"\\server\share")
+        );
+        // Path plain fica igual (idempotente).
+        assert_eq!(
+            normalize_verbatim(Path::new(r"C:\dev")),
+            PathBuf::from(r"C:\dev")
+        );
     }
 }
 

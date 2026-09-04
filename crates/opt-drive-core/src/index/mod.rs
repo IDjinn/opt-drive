@@ -270,6 +270,16 @@ impl Indexer {
                             }
                         }
 
+                        // Dirs de sistema na raiz do drive (C:\Windows, …) e
+                        // arquivos de sistema (pagefile.sys, …): nunca indexar.
+                        if crate::protected::skip_in_walk(path) {
+                            return if is_dir {
+                                WalkState::Skip
+                            } else {
+                                WalkState::Continue
+                            };
+                        }
+
                         // Detecção de project root (dir com .git) → alimenta cache compartilhado.
                         if is_dir && path.join(".git").exists() {
                             if let Ok(mut p) = projects.lock() {

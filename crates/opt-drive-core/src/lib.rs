@@ -8,6 +8,8 @@
 //! - [`usage`]: cálculo de "atividade" (combina mtime/atime/git).
 //! - [`policy`]: engine de regras → lista de [`policy::Action`].
 //! - [`ops`]: execução de operações (mover+junction, limpeza, compressão) com journal/undo.
+//! - [`protected`]: caminhos especiais (sistema, nuvem, junctions) que o opt-drive
+//!   nunca modifica.
 //! - [`providers`]: trait [`providers::BackupProvider`] (Google Drive na fase 2).
 
 pub mod browse;
@@ -17,6 +19,7 @@ pub mod drives;
 pub mod index;
 pub mod ops;
 pub mod policy;
+pub mod protected;
 pub mod providers;
 pub mod usage;
 

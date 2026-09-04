@@ -277,7 +277,7 @@ fn cmd_tier(config_path: &Path, db_path: &Path, apply: bool) -> anyhow::Result<(
     }
     let entries = db.list_all();
     let scorer = ActivityScorer::new();
-    let plan = policy::plan(&cfg.rules, &entries, &drives, &scorer, unix_now());
+    let plan = policy::plan(&cfg.rules, &entries, &drives, &scorer, unix_now(), &cfg.protected_paths);
 
     if plan.is_empty() {
         println!("Nenhuma ação de tiering a fazer. 🎯");

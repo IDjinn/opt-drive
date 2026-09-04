@@ -21,6 +21,11 @@ pub fn collect(root: &Path, rules: &CleanupRules) -> Vec<PathBuf> {
             Ok(d) => d,
             Err(_) => continue,
         };
+        // Reparse points (junction/symlink) nunca são coletados: um link cujo
+        // *nome* casou com as regras deve ser preservado, e nunca atravessado.
+        if dent.file_type().is_symlink() {
+            continue;
+        }
         let Some(name) = dent.file_name().to_str() else {
             continue;
         };

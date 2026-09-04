@@ -115,8 +115,13 @@ impl Executor {
                 continue;
             }
 
-            // Execução real.
-            let result = self.execute_action(action);
+            // Execução real. Caminhos protegidos (sistema/nuvem/junctions) são
+            // recusados aqui mesmo — rede de segurança caso o plano venha de um
+            // índice/config desatualizados.
+            let result = match crate::protected::refusal_reason(Path::new(&src)) {
+                Some(reason) => Err(anyhow::anyhow!("caminho protegido ({reason}) — ação ignorada")),
+                None => self.execute_action(action),
+            };
             let (status, msg, undoable) = match result {
                 Ok(bytes_cleaned) => {
                     report.bytes_cleaned += bytes_cleaned;

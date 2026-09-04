@@ -17,6 +17,10 @@
 //! [cleanup]
 //! targets = ["node_modules", "target", ".venv", "__pycache__", "dist", "build", ".next"]
 //!
+//! # Caminhos extras que o opt-drive nunca move/apaga (sistema/nuvem já são
+//! # protegidos embutidos — veja `protected.rs`).
+//! protected_paths = ["D:\\dados-irreplaceables"]
+//!
 //! [[rules]]
 //! name = "projetos-inativos"
 //! match_glob = "**/*"
@@ -61,6 +65,11 @@ pub struct Config {
     /// Backup/sync para conectores remotos (S3, Google Drive) ou local.
     #[serde(default)]
     pub backup: BackupConfig,
+
+    /// Caminhos extras que nunca devem ser movidos/apagados (além dos embutidos
+    /// em [`crate::protected`]). Um caminho protege toda a sua subárvore.
+    #[serde(default)]
+    pub protected_paths: Vec<PathBuf>,
 }
 
 /// Configuração de backup/sync (Fase 2). `connector` seleciona o backend:

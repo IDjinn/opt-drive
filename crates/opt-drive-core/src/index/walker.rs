@@ -54,6 +54,15 @@ pub fn for_each_entry<F>(
             }
         }
 
+        // Dirs de sistema na raiz do drive (C:\Windows, $RECYCLE.BIN, …) e
+        // arquivos de sistema (pagefile.sys, …): nunca indexar.
+        if crate::protected::skip_in_walk(path) {
+            if dent.file_type().is_dir() {
+                it.skip_current_dir();
+            }
+            continue;
+        }
+
         // Detecção de project root: diretório com `.git`.
         let is_dir = dent.file_type().is_dir();
         if is_dir && path.join(".git").exists() {

@@ -103,12 +103,18 @@ impl Plan {
 }
 
 /// Gera um plano a partir das regras, índice e drives.
+///
+/// `protected` são os extras do usuário (`config.protected_paths`) — os embutidos
+/// (sistema/nuvem) vêm de [`crate::protected::is_protected`]; candidatos
+/// protegidos nunca geram ações.
+#[allow(clippy::too_many_arguments)]
 pub fn plan(
     rules: &[Rule],
     entries: &[FileEntry],
     drives: &[Drive],
     scorer: &ActivityScorer,
     now: i64,
+    protected: &[std::path::PathBuf],
 ) -> Plan {
     // Mapa tier → primeiro drive daquele tier (destino padrão).
     let mut drive_by_tier: HashMap<Tier, &Drive> = HashMap::new();
@@ -141,6 +147,16 @@ pub fn plan(
 
         for cand in &candidates {
             if handled.contains(&cand.path) {
+                continue;
+            }
+            // Nunca planejar ações sobre caminhos protegidos (sistema, nuvem,
+            // extras da config) — o executor refaz este check antes de agir.
+            if crate::protected::is_protected_with(Path::new(&cand.path), protected).is_some() {
+                tracing::debug!(
+                    target: "opt-drive.policy",
+                    path = %cand.path,
+                    "skip: caminho protegido"
+                );
                 continue;
             }
             let debug = std::env::var("OPTDRIVE_DEBUG").is_ok();
@@ -301,7 +317,7 @@ mod tests {
             ..Default::default()
         };
         let scorer = ActivityScorer::new();
-        let p = plan(&[rule], &entries, &drives, &scorer, 86_400 * 100);
+        let p = plan(&[rule], &entries, &drives, &scorer, 86_400 * 100, &[]);
 
         assert_eq!(p.actions.len(), 1);
         match &p.actions[0] {
@@ -315,5 +331,40 @@ mod tests {
             }
             _ => panic!("esperava Relocate"),
         }
+    }
+
+    #[test]
+    fn skips_protected_candidates() {
+        let drives = vec![drive("C:\\", Tier::Fast), drive("D:\\", Tier::Slow)];
+        // Candidato em pasta de cloud-sync + candidato protegido por config.
+        let entries = vec![
+            FileEntry {
+                path: r"C:\Users\lucas\Google Drive".into(),
+                is_dir: true,
+                size: 0,
+                mtime: 0,
+                atime: 0,
+                drive: "C:\\".into(),
+                project_root: Some(r"C:\Users\lucas\Google Drive".into()),
+            },
+            FileEntry {
+                path: r"C:\dev\secreto".into(),
+                is_dir: true,
+                size: 0,
+                mtime: 0,
+                atime: 0,
+                drive: "C:\\".into(),
+                project_root: Some(r"C:\dev\secreto".into()),
+            },
+        ];
+        let rule = Rule {
+            name: "t".into(),
+            inactive_days: 1,
+            ..Default::default()
+        };
+        let scorer = ActivityScorer::new();
+        let protected = vec![std::path::PathBuf::from(r"C:\dev\secreto")];
+        let p = plan(&[rule], &entries, &drives, &scorer, 86_400 * 100, &protected);
+        assert!(p.actions.is_empty());
     }
 }
