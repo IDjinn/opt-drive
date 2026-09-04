@@ -54,6 +54,8 @@ export interface DirEntry {
   size_bytes: number;
   mtime: number;
   indexed: boolean;
+  /** Entrada especial (sistema, cloud-sync, junction) — nunca modificada pelo opt-drive. */
+  protected: boolean;
 }
 
 export interface WatchConfig {
@@ -174,6 +176,7 @@ export type DaemonEvent =
   | { type: 'scan_progress'; indexed: number; current_dir: string | null; total_estimate: number | null; elapsed_ms: number; bytes: number; errors: number }
   | { type: 'scan_done'; stats: { roots_scanned: number; entries_indexed: number; dirs: number; files: number; total_bytes: number } }
   | { type: 'scan_canceled' }
+  | { type: 'scan_failed'; error: string }
   | { type: 'index_updated'; stats: { upserted: number; removed: number; skipped: number } }
   | { type: 'tier_preview'; plan: Plan }
   | { type: 'tier_started' }

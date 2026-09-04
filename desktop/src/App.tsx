@@ -97,14 +97,24 @@ export default function App() {
           setLiveActivity(null);
           indexQ.refresh();
           break;
-        case 'index_updated':
-          // Incremento em tempo real: atualiza o contador (throttled p/ não inundar).
-          setRefreshKey((k) => k + 1);
+        case 'scan_failed':
+          setScanning(false);
+          setScan(null);
+          setLiveActivity(`Falha na indexação: ${ev.error}`);
+          indexQ.refresh();
+          break;
+        case 'index_updated': {
+          // Incremento em tempo real (contador e revalidações no MESMO throttle de
+          // 3s). Sem o throttle, cada evento cancelava o fetch do tier/preview em
+          // andamento (o useCached descarta a resposta do effect anterior) e a aba
+          // Tiering ficava em skeleton eterno durante atividade do watcher.
           if (Date.now() - lastStatusRefresh.current > 3000) {
             lastStatusRefresh.current = Date.now();
             indexQ.refresh();
+            setRefreshKey((k) => k + 1);
           }
           break;
+        }
         case 'tier_progress':
           setLiveActivity(`${(ev.frac * 100).toFixed(0)}% — ${ev.desc}`);
           break;
@@ -191,7 +201,7 @@ export default function App() {
       <main className="content">
         {[...mounted].map((t) => (
           <div key={t} className={tab === t ? 'tab-panel' : 'tab-panel hidden'}>
-            {t === 'drives' && <Drives />}
+            {t === 'drives' && <Drives scanning={scanning} />}
             {t === 'index' && <Index scanning={scanning} scan={scan} refreshKey={refreshKey} />}
             {t === 'tiering' && <Tiering refreshKey={refreshKey} />}
             {t === 'rules' && <Rules />}

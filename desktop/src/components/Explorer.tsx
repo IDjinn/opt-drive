@@ -34,8 +34,9 @@ function fmtDate(unix: number): string {
   return d.toLocaleDateString('pt-BR');
 }
 
-export default function Explorer({ root }: { root: string }) {
+export default function Explorer({ root, scanning = false }: { root: string; scanning?: boolean }) {
   const [path, setPath] = useState(root);
+  const [scanErr, setScanErr] = useState<string | null>(null);
 
   // Trocou o drive selecionado → volta para a raiz dele.
   useEffect(() => {
@@ -54,7 +55,8 @@ export default function Explorer({ root }: { root: string }) {
 
   const go = (p: string) => setPath(p);
   const crumbs = segments(path);
-  const atRoot = path === root;
+  // Windows é case-insensitive: comparar em minúsculas evita "C:\DEV" ≠ "c:\dev".
+  const atRoot = path.toLowerCase() === root.toLowerCase();
 
   return (
     <section className="explorer">
@@ -64,8 +66,18 @@ export default function Explorer({ root }: { root: string }) {
             Explorer {revalidating && <span className="revalidating-dot" />}
           </h2>
           {atRoot && (
-            <button className="link-btn" onClick={() => api.indexRun().catch(() => {})}>
-              ⚡ Indexar agora
+            <button
+              className="link-btn"
+              disabled={scanning}
+              title={scanning ? 'varredura em andamento' : 'varre os watch paths configurados'}
+              onClick={() => {
+                setScanErr(null);
+                api
+                  .indexRun()
+                  .catch((e) => setScanErr(String(e.message ?? e)));
+              }}
+            >
+              {scanning ? 'Indexando…' : '⚡ Indexar agora'}
             </button>
           )}
         </div>
@@ -87,14 +99,15 @@ export default function Explorer({ root }: { root: string }) {
 
       {atRoot && (
         <div className="callout subtle">
-          Para ver o <strong>tamanho das pastas</strong>, indexe este drive: adicione-o em{' '}
-          <strong>Regras → Watch paths</strong> e clique em “Indexar agora” (ou ↻ Re-indexar na
-          sidebar). Pastas não indexadas aparecem com “—”. A estrutura de arquivos sempre é lista em
-          tempo real.
+          Para ver o <strong>tamanho das pastas</strong>, indexe este drive: ative{' '}
+          <strong>Indexar</strong> no card do drive (ou edite <strong>Regras → Watch paths</strong>)
+          e clique em “Indexar agora”. Pastas não indexadas aparecem com “—”. A estrutura de
+          arquivos sempre é lista em tempo real.
         </div>
       )}
 
       {!safe && <div className="error">Caminho inválido.</div>}
+      {safe && scanErr && <div className="error">{scanErr}</div>}
       {safe && error && <div className="error">{error}</div>}
       {safe && loading && <ExplorerSkeleton count={7} />}
       {safe && !loading && entries && entries.length === 0 && (
@@ -116,6 +129,14 @@ export default function Explorer({ root }: { root: string }) {
               <span className="ex-name">
                 <span className="ex-icon">{e.is_dir ? '📁' : '📄'}</span>
                 <span className="ex-fname">{e.name}</span>
+                {e.protected && (
+                  <span
+                    className="ex-protected"
+                    title="caminho especial (sistema/nuvem/junction) — protegido contra exclusão e movimentação"
+                  >
+                    🔒
+                  </span>
+                )}
                 {e.is_dir &&
                   (e.indexed ? (
                     <span className="indexed-dot" title="tamanho do índice" />

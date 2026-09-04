@@ -18,15 +18,17 @@ export default function Tiering({ refreshKey }: { refreshKey: number }) {
     setBusy(true);
     setResult(null);
     try {
-      const { report } = await api.tierApply();
+      // O daemon retorna o RunReport puro — desestruturar {report} dava TypeError.
+      const report = await api.tierApply();
+      const journal = report.journal_id ? ` · journal ${report.journal_id}` : '';
       setResult(
         `${report.relocated} movidos, ${report.compressed} comprimidos, ~${fmtBytes(
           report.bytes_cleaned,
-        )} limpos, ${report.errors} erros.`,
+        )} limpos, ${report.errors} erros${journal}.`,
       );
       refresh(); // revalida o plano (ações aplicadas)
     } catch (e) {
-      setResult(`Erro: ${e}`);
+      setResult(`Erro: ${e instanceof Error ? e.message : e}`);
     } finally {
       setBusy(false);
     }

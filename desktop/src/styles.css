@@ -282,6 +282,75 @@ button.primary {
   font-variant-numeric: tabular-nums;
 }
 
+/* ---------- Drives: gerenciamento por card ---------- */
+.drive-manage {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 12px;
+  padding-top: 10px;
+  border-top: 1px solid var(--border);
+}
+.drive-index-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--text-dim);
+  cursor: pointer;
+}
+.drive-tier-field {
+  margin-left: auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--text-dim);
+}
+.drive-tier-field select {
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  color: var(--text);
+  border-radius: 6px;
+  padding: 3px 6px;
+  font-size: 12px;
+  font-family: inherit;
+}
+.drive-paths {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 8px;
+}
+.drive-path-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  background: var(--bg-elev2);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 2px 4px 2px 10px;
+  font-size: 11px;
+  font-family: 'Cascadia Code', 'SF Mono', Consolas, monospace;
+  color: var(--text-dim);
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.chip-x {
+  background: transparent;
+  border: none;
+  color: var(--text-dim);
+  cursor: pointer;
+  font-size: 13px;
+  line-height: 1;
+  padding: 2px 6px;
+  border-radius: 50%;
+}
+.chip-x:hover:not(:disabled) {
+  color: var(--danger);
+  background: var(--bg-elev);
+}
+
 /* ---------- Tiering ---------- */
 .plan-summary {
   display: flex;
@@ -628,6 +697,12 @@ code {
 .unknown-dot {
   background: var(--text-dim);
   opacity: 0.5;
+}
+.ex-protected {
+  font-size: 11px;
+  margin-left: 6px;
+  opacity: 0.85;
+  cursor: help;
 }
 .link-btn {
   background: transparent;

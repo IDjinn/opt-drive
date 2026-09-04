@@ -35,10 +35,24 @@ function wsBase(): string {
 }
 
 async function req<T>(path: string, init?: RequestInit): Promise<T> {
-  const res = await fetch(`${apiBase()}${path}`, {
-    ...init,
-    headers: { 'Content-Type': 'application/json', ...(init?.headers ?? {}) },
-  });
+  // Timeout (30s): um daemon lento/preso não pode deixar a UI em skeleton eterno.
+  const timeout =
+    typeof AbortSignal !== 'undefined' && typeof AbortSignal.timeout === 'function'
+      ? AbortSignal.timeout(30_000)
+      : undefined;
+  let res: Response;
+  try {
+    res = await fetch(`${apiBase()}${path}`, {
+      ...init,
+      signal: init?.signal ?? timeout,
+      headers: { 'Content-Type': 'application/json', ...(init?.headers ?? {}) },
+    });
+  } catch (e) {
+    if (e instanceof DOMException && (e.name === 'TimeoutError' || e.name === 'AbortError')) {
+      throw new Error('tempo esgotado aguardando o daemon (30s)');
+    }
+    throw e;
+  }
   if (!res.ok) {
     const text = await res.text().catch(() => '');
     throw new Error(`${res.status} ${res.statusText} — ${text}`);
@@ -59,8 +73,8 @@ export const api = {
   browse: (path: string) => req<DirEntry[]>('/api/browse?path=' + encodeURIComponent(path)),
   cleanupCatalog: () => req<CleanupTarget[]>('/api/cleanup/catalog'),
   tierPreview: () => req<Plan>('/api/tier/preview'),
-  tierApply: () =>
-    req<{ report: RunReport; journal: string }>('/api/tier/apply', { method: 'POST' }),
+  // O daemon retorna o RunReport puro (não um wrapper {report, journal}).
+  tierApply: () => req<RunReport>('/api/tier/apply', { method: 'POST' }),
   backupStatus: () => req<BackupStatus>('/api/backup/status'),
   backupRun: () => req<SyncReport>('/api/backup/run', { method: 'POST' }),
   backupRestore: (remoteId: string, dst: string) =>
