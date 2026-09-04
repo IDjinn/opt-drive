@@ -3,13 +3,18 @@
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use serde::Serialize;
 use tokio::sync::{broadcast, Mutex as AsyncMutex};
 
 use opt_drive_core::config::Config;
+use opt_drive_core::drives::Drive;
 use opt_drive_core::ops::RunReport;
 use opt_drive_core::policy::Plan;
+
+/// Por quanto tempo o cache de enumeração de drives é considerado fresco.
+const DRIVES_TTL: Duration = Duration::from_secs(30);
 
 /// Eventos transmitidos via WebSocket `/api/events`.
 #[derive(Debug, Clone, Serialize)]
@@ -32,6 +37,8 @@ pub enum Event {
     ScanDone { stats: ScanStatsDto },
     /// Varredura cancelada a pedido do usuário (parou cedo, com stats parciais).
     ScanCanceled,
+    /// Varredura falhou com erro (evento terminal — a UI sai do estado "indexando").
+    ScanFailed { error: String },
     /// Incremento de indexação em tempo real (file-watcher aplicou um lote).
     IndexUpdated { stats: ChangeStatsDto },
     TierPreview { plan: Plan },
@@ -84,6 +91,9 @@ impl From<opt_drive_core::index::ScanStats> for ScanStatsDto {
     }
 }
 
+/// Entrada do cache de drives: momento da enumeração + snapshot.
+type DrivesCache = Option<(Instant, Vec<Drive>)>;
+
 /// Estado da aplicação, compartilhado entre handlers e scheduler.
 #[derive(Clone)]
 pub struct AppState {
@@ -97,6 +107,12 @@ pub struct AppState {
     /// endpoint `/api/index/cancel`; o scan a checa e para cedo. Garantimos no máximo
     /// um scan por vez via `run_lock`.
     pub scan_cancel: Arc<Mutex<Option<Arc<AtomicBool>>>>,
+    /// Cache da enumeração de drives. No Windows a enumeração spawna PowerShell
+    /// (`Get-Disk`/`Get-PhysicalDisk`, 1-10s); browse/preview chamam a cada request,
+    /// então servimos do cache e renovamos só quando o TTL vence.
+    drives_cache: Arc<AsyncMutex<DrivesCache>>,
+    /// Watcher em andamento (trocado quando a config muda — ver `api::put_config`).
+    pub watcher: Arc<Mutex<Option<crate::watcher::WatcherHandle>>>,
 }
 
 impl AppState {
@@ -108,12 +124,35 @@ impl AppState {
             events,
             run_lock: Arc::new(AsyncMutex::new(())),
             scan_cancel: Arc::new(Mutex::new(None)),
+            drives_cache: Arc::new(AsyncMutex::new(None)),
+            watcher: Arc::new(Mutex::new(None)),
         }
     }
 
     /// Carrega a config atual (relê do disco a cada chamada).
     pub fn load_config(&self) -> anyhow::Result<Config> {
         Config::load_or_create(&self.config_path)
+    }
+
+    /// Drives enumerados com cache (TTL [`DRIVES_TTL`]). A enumeração roda em
+    /// `spawn_blocking` — nunca no worker tokio que atende o request.
+    pub async fn cached_drives(&self, cfg: &Config) -> anyhow::Result<Vec<Drive>> {
+        {
+            let guard = self.drives_cache.lock().await;
+            if let Some((ts, drives)) = guard.as_ref() {
+                if ts.elapsed() < DRIVES_TTL {
+                    return Ok(drives.clone());
+                }
+            }
+        }
+        let cfg = cfg.clone();
+        let drives = tokio::task::spawn_blocking(move || {
+            opt_drive_core::drives::enumerate(|m| cfg.tier_for(m))
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("join da enumeração de drives: {e}"))?;
+        *self.drives_cache.lock().await = Some((Instant::now(), drives.clone()));
+        Ok(drives)
     }
 
     pub fn emit(&self, event: Event) {

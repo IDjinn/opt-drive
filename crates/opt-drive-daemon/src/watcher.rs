@@ -19,6 +19,7 @@
 //!   `Event::IndexUpdated`.
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -30,24 +31,38 @@ use opt_drive_core::index::{ChangeBatch, ChangeStats, FsChange, Indexer};
 
 use crate::state::{ChangeStatsDto, Event, AppState};
 
-/// Inicia o file-watcher (se habilitado na config). Retorna imediatamente; o watcher
-/// roda numa thread própria. Não faz nada (e loga) quando `watch.realtime = false` ou
-/// não há `watch.paths`.
-pub fn start(state: AppState) -> anyhow::Result<()> {
+/// Handle para parar o watcher (a thread encerra em até ~500ms).
+#[derive(Clone)]
+pub struct WatcherHandle {
+    stop: Arc<AtomicBool>,
+}
+
+impl WatcherHandle {
+    /// Sinaliza parada (idempotente). O watcher libera os watches ao encerrar.
+    pub fn stop(&self) {
+        self.stop.store(true, Ordering::Relaxed);
+    }
+}
+
+/// Inicia o file-watcher (se habilitado na config). Retorna `None` quando
+/// `watch.realtime = false` ou não há `watch.paths`; o watcher roda numa thread
+/// própria e pode ser trocado em runtime via [`WatcherHandle::stop`] + novo
+/// `start` (usado pelo `PUT /api/config`).
+pub fn start(state: AppState) -> anyhow::Result<Option<WatcherHandle>> {
     let cfg = state.load_config()?;
     if !cfg.watch.realtime {
         tracing::info!(
             target: "opt-drive.watch",
             "watcher desligado pela config (watch.realtime = false)"
         );
-        return Ok(());
+        return Ok(None);
     }
     if cfg.watch.paths.is_empty() {
         tracing::info!(
             target: "opt-drive.watch",
             "watcher ocioso (nenhum watch.path configurado)"
         );
-        return Ok(());
+        return Ok(None);
     }
 
     // Clamp defensativo: janela útil entre 50ms e 5s.
@@ -62,13 +77,27 @@ pub fn start(state: AppState) -> anyhow::Result<()> {
     let events = state.events.clone();
     let runtime = tokio::runtime::Handle::try_current()?;
 
+    let handle = WatcherHandle {
+        stop: Arc::new(AtomicBool::new(false)),
+    };
+    let stop = handle.stop.clone();
+
     std::thread::Builder::new()
         .name("opt-drive-watcher".into())
         .spawn(move || {
-            watcher_loop(paths, debounce_ms, ignore_globs, rules, db_path, events, runtime)
+            watcher_loop(
+                paths,
+                debounce_ms,
+                ignore_globs,
+                rules,
+                db_path,
+                events,
+                runtime,
+                stop,
+            )
         })?;
 
-    Ok(())
+    Ok(Some(handle))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -80,6 +109,7 @@ fn watcher_loop(
     db_path: PathBuf,
     events: tokio::sync::broadcast::Sender<Event>,
     runtime: tokio::runtime::Handle,
+    stop: Arc<AtomicBool>,
 ) {
     let (tx, rx) = std::sync::mpsc::channel::<DebounceEventResult>();
 
@@ -118,8 +148,19 @@ fn watcher_loop(
     }
     tracing::info!(target: "opt-drive.watch", watched, debounce_ms, "watcher ativo");
 
-    // O `debouncer` vive nesta thread; o loop abaixo o mantém vivo até o processo encerrar.
-    while let Ok(res) = rx.recv() {
+    // O `debouncer` vive nesta thread; o loop abaixo o mantém vivo até receber a
+    // ordem de parada (troca de config) ou o processo encerrar. O polling de 500ms
+    // no `recv_timeout` é o que permite observar a flag `stop`.
+    loop {
+        if stop.load(Ordering::Relaxed) {
+            tracing::info!(target: "opt-drive.watch", "watcher parado (config trocada)");
+            break;
+        }
+        let res = match rx.recv_timeout(Duration::from_millis(500)) {
+            Ok(r) => r,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        };
         let event_vec = match res {
             Ok(v) => v,
             Err(e) => {

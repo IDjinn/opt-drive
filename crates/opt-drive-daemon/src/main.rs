@@ -64,10 +64,23 @@ async fn main() -> anyhow::Result<()> {
 
     let state = AppState::new(config_path.clone(), db_path.clone());
 
+    // Pré-aquece o cache de drives (PowerShell demora segundos; sem isto o 1º
+    // browse da UI paga o custo).
+    {
+        let warm = state.clone();
+        tokio::spawn(async move {
+            if let Ok(cfg) = warm.load_config() {
+                let _ = warm.cached_drives(&cfg).await;
+            }
+        });
+    }
+
     // File-watcher em tempo real (indexação incremental). Best-effort: se falhar, o
-    // daemon continua com o scan completo periódico do scheduler.
-    if let Err(e) = watcher::start(state.clone()) {
-        tracing::warn!(target: "opt-drive.watch", error = %e, "watcher não iniciado");
+    // daemon continua com o scan completo periódico do scheduler. O handle fica no
+    // state p/ permitir a troca quando a config muda (PUT /api/config).
+    match watcher::start(state.clone()) {
+        Ok(h) => *state.watcher.lock().unwrap() = h,
+        Err(e) => tracing::warn!(target: "opt-drive.watch", error = %e, "watcher não iniciou"),
     }
 
     // Scheduler: re-index periódico (não aplica tiering automaticamente).
@@ -124,7 +137,7 @@ async fn scheduler(state: AppState, interval: Duration) {
             let threads = cfg.indexer.threads;
             let db_path = state.db_path.clone();
             state.emit(state::Event::ScanStarted { total_estimate: None });
-            let _ = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+            let res = tokio::task::spawn_blocking(move || -> anyhow::Result<state::ScanStatsDto> {
                 let indexer = opt_drive_core::index::Indexer::open(&db_path)?;
                 let stats = indexer.scan(&paths, &globs, &cleanup, threads, None, |p| {
                     let _ = events.send(state::Event::ScanProgress {
@@ -136,12 +149,23 @@ async fn scheduler(state: AppState, interval: Duration) {
                         errors: p.errors,
                     });
                 })?;
-                let _ = events.send(state::Event::ScanDone {
-                    stats: state::ScanStatsDto::from(stats),
-                });
-                Ok(())
+                Ok(state::ScanStatsDto::from(stats))
             })
             .await;
+            // Evento terminal sempre (sem isso a UI fica presa em "Indexando…").
+            match res {
+                Ok(Ok(stats)) => {
+                    state.emit(state::Event::ScanDone { stats });
+                }
+                Ok(Err(e)) => {
+                    tracing::error!(target: "opt-drive.index", error = %e, "varredura agendada falhou");
+                    state.emit(state::Event::ScanFailed { error: format!("{e:#}") });
+                }
+                Err(e) => {
+                    tracing::error!(target: "opt-drive.index", error = %e, "join da varredura falhou");
+                    state.emit(state::Event::ScanFailed { error: format!("join: {e}") });
+                }
+            }
         }
     }
 }

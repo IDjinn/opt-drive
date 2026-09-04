@@ -52,7 +52,7 @@ async fn health() -> Json<serde_json::Value> {
 
 async fn drives_handler(State(st): State<AppState>) -> R<Vec<Drive>> {
     let cfg = st.load_config()?;
-    Ok(Json(drives::enumerate(|m| cfg.tier_for(m))))
+    Ok(Json(st.cached_drives(&cfg).await?))
 }
 
 async fn get_config(State(st): State<AppState>) -> R<Config> {
@@ -61,16 +61,32 @@ async fn get_config(State(st): State<AppState>) -> R<Config> {
 
 async fn put_config(State(st): State<AppState>, Json(cfg): Json<Config>) -> R<serde_json::Value> {
     cfg.save(&st.config_path)?;
+    // Reinicia o file-watcher com os paths novos — ele só lia a config no startup;
+    // sem isto, adicionar/remover drives da indexação só valeria após reiniciar.
+    if let Some(h) = st.watcher.lock().unwrap().take() {
+        h.stop();
+    }
+    match crate::watcher::start(st.clone()) {
+        Ok(h) => *st.watcher.lock().unwrap() = h,
+        Err(e) => tracing::warn!(target: "opt-drive.watch", error = %e, "watcher não reiniciou"),
+    }
     Ok(Json(json!({ "saved": true })))
 }
 
+/// Dispara a varredura completa como job em background: valida a config, garante
+/// exclusão via `run_lock` (409 se algo já roda) e responde `{"started":true}` na
+/// hora. Progresso e término chegam via WS (`ScanProgress`/`ScanDone`/…).
 async fn index_run(State(st): State<AppState>) -> R<serde_json::Value> {
     let cfg = st.load_config()?;
     if cfg.watch.paths.is_empty() {
         return Err(AppError::msg(StatusCode::BAD_REQUEST, "nenhum watch.path configurado"));
     }
 
-    let _lock = st.run_lock.clone().lock_owned().await;
+    // Não espera na fila: com scan/tier/backup em andamento, falha rápido com 409
+    // (antes o request ficava pendurado até o job anterior terminar).
+    let lock = st.run_lock.clone().try_lock_owned().map_err(|_| {
+        AppError::msg(StatusCode::CONFLICT, "uma operação pesada já está em andamento (scan/tier/backup)")
+    })?;
 
     // Cria a flag de cancelamento e registra no slot (sempre limpa ao sair).
     let cancel = Arc::new(AtomicBool::new(false));
@@ -79,12 +95,35 @@ async fn index_run(State(st): State<AppState>) -> R<serde_json::Value> {
         *slot = Some(cancel.clone());
     }
 
+    let st_for_task = st.clone();
+    tokio::spawn(async move {
+        run_scan(st_for_task, &cfg, lock, cancel).await;
+    });
+
+    Ok(Json(json!({ "started": true })))
+}
+
+/// Corpo do scan (task em background; o HTTP já respondeu). Garante evento
+/// terminal em **todos** os caminhos — sem isso a UI fica presa em "Indexando…".
+async fn run_scan(
+    st: AppState,
+    cfg: &Config,
+    _lock: tokio::sync::OwnedMutexGuard<()>,
+    cancel: Arc<AtomicBool>,
+) {
     // Estimativa de total (do último scan) — permite à UI desenhar a barra imediatamente.
     let db_path_for_est = st.db_path.clone();
-    let total_estimate = spawn_blocking(move || -> anyhow::Result<Option<usize>> {
+    let total_estimate = match spawn_blocking(move || -> anyhow::Result<Option<usize>> {
         Ok(IndexDb::open(&db_path_for_est)?.scan_total_estimate())
     })
-    .await?;
+    .await
+    {
+        Ok(n) => n,
+        Err(e) => {
+            finish_scan(&st, &cancel, ScanEnd::Failed(e.msg));
+            return;
+        }
+    };
     st.emit(Event::ScanStarted { total_estimate });
 
     let threads = cfg.indexer.threads;
@@ -95,8 +134,6 @@ async fn index_run(State(st): State<AppState>) -> R<serde_json::Value> {
     let db_path = st.db_path.clone();
     let cancel_for_task = cancel.clone();
 
-    // spawn_blocking direto (sem o helper) p/ podermos limpar o slot e emitir
-    // ScanCanceled/ScanDone em todos os caminhos (incl. erro).
     let join = tokio::task::spawn_blocking(
         move || -> anyhow::Result<opt_drive_core::index::ScanStats> {
             let indexer = opt_drive_core::index::Indexer::open(&db_path)?;
@@ -122,15 +159,30 @@ async fn index_run(State(st): State<AppState>) -> R<serde_json::Value> {
     )
     .await;
 
-    // Limpa o slot sempre (mesmo em erro/cancel).
+    let end = match join {
+        Ok(Ok(stats)) => ScanEnd::Done(stats),
+        Ok(Err(e)) => ScanEnd::Failed(format!("{e:#}")),
+        Err(e) => ScanEnd::Failed(format!("join: {e}")),
+    };
+    finish_scan(&st, &cancel, end);
+}
+
+/// Desfecho possível de uma varredura (cancelamento é detectado pela flag no
+/// `finish_scan` — o scan cancelado ainda retorna `Ok(stats)` parciais).
+enum ScanEnd {
+    Done(opt_drive_core::index::ScanStats),
+    Failed(String),
+}
+
+/// Limpa o slot de cancelamento e emite o evento terminal (sempre chamado).
+fn finish_scan(st: &AppState, cancel: &AtomicBool, end: ScanEnd) {
     {
         let mut slot = st.scan_cancel.lock().unwrap();
         *slot = None;
     }
-
     let canceled = cancel.load(Ordering::Relaxed);
-    match join {
-        Ok(Ok(stats)) => {
+    match end {
+        ScanEnd::Done(stats) => {
             if canceled {
                 st.emit(Event::ScanCanceled);
             } else {
@@ -138,13 +190,11 @@ async fn index_run(State(st): State<AppState>) -> R<serde_json::Value> {
                     stats: ScanStatsDto::from(stats),
                 });
             }
-            Ok(Json(json!({ "started": true, "canceled": canceled })))
         }
-        Ok(Err(e)) => Err(AppError::from(e)),
-        Err(e) => Err(AppError::msg(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("join: {e}"),
-        )),
+        ScanEnd::Failed(e) => {
+            tracing::error!(target: "opt-drive.index", error = %e, "varredura falhou");
+            st.emit(Event::ScanFailed { error: e });
+        }
     }
 }
 
@@ -187,21 +237,20 @@ async fn browse(
     if q.path.is_empty() {
         return Err(AppError::msg(StatusCode::BAD_REQUEST, "path vazio"));
     }
-    if q.path.contains("..") {
+    // `..` só importa como componente (pastas como `my..folder` são válidas).
+    let path = PathBuf::from(&q.path);
+    if path.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
         return Err(AppError::msg(StatusCode::BAD_REQUEST, "caminho inválido (..)"));
     }
-    let path = PathBuf::from(&q.path);
     if !path.is_absolute() {
         return Err(AppError::msg(StatusCode::BAD_REQUEST, "caminho deve ser absoluto"));
     }
-    // Canonicaliza (resolve `.`/junctions) e confere que está sob um drive conhecido.
-    let canon = path.canonicalize().unwrap_or(path);
-    let mounts: Vec<String> = drives::enumerate(|m| cfg.tier_for(m))
-        .into_iter()
-        .map(|d| d.mount)
-        .collect();
+    // Canonicaliza (resolve `.`/junctions), remove o prefixo verbatim `\\?\` (as
+    // chaves do índice são plain) e confere que está sob um drive conhecido.
+    let canon = opt_drive_core::browse::normalize_verbatim(&path.canonicalize().unwrap_or(path));
+    let drives = st.cached_drives(&cfg).await?;
     let mount = drives::mount_of(&canon);
-    if !matches!(mount.as_deref(), Some(m) if mounts.iter().any(|x| x == m)) {
+    if !matches!(mount.as_deref(), Some(m) if drives.iter().any(|d| d.mount == m)) {
         return Err(AppError::msg(
             StatusCode::BAD_REQUEST,
             "caminho fora dos drives monitorados",
@@ -237,14 +286,14 @@ async fn cleanup_catalog(State(st): State<AppState>) -> R<Vec<CleanupTarget>> {
 
 async fn tier_preview(State(st): State<AppState>) -> R<Plan> {
     let cfg = st.load_config()?;
-    let drives = drives::enumerate(|m| cfg.tier_for(m));
+    let drives = st.cached_drives(&cfg).await?;
 
     let st2 = st.clone();
     let plan = spawn_blocking(move || -> anyhow::Result<Plan> {
         let db = IndexDb::open(&st2.db_path)?;
         let entries = db.list_all();
         let scorer = ActivityScorer::new();
-        Ok(policy::plan(&cfg.rules, &entries, &drives, &scorer, unix_now()))
+        Ok(policy::plan(&cfg.rules, &entries, &drives, &scorer, unix_now(), &cfg.protected_paths))
     })
     .await?;
 
@@ -254,9 +303,13 @@ async fn tier_preview(State(st): State<AppState>) -> R<Plan> {
 
 async fn tier_apply(State(st): State<AppState>) -> R<RunReport> {
     let cfg = st.load_config()?;
-    let drives = drives::enumerate(|m| cfg.tier_for(m));
+    let drives = st.cached_drives(&cfg).await?;
 
-    let _lock = st.run_lock.clone().lock_owned().await;
+    // 409 se houver scan/backup em andamento — antes o request pendurava no
+    // `run_lock` até o outro job terminar (UI em "Aplicando…" indefinidamente).
+    let _lock = st.run_lock.clone().try_lock_owned().map_err(|_| {
+        AppError::msg(StatusCode::CONFLICT, "uma operação pesada já está em andamento (scan/tier/backup)")
+    })?;
     st.emit(Event::TierStarted);
 
     let st2 = st.clone();
@@ -266,7 +319,8 @@ async fn tier_apply(State(st): State<AppState>) -> R<RunReport> {
         let db = IndexDb::open(&st2.db_path)?;
         let entries = db.list_all();
         let scorer = ActivityScorer::new();
-        let plan = policy::plan(&cfg.rules, &entries, &drives, &scorer, unix_now());
+        let plan =
+            policy::plan(&cfg.rules, &entries, &drives, &scorer, unix_now(), &cfg.protected_paths);
 
         let exec = Executor::new(cfg.cleanup.effective_targets(), false);
         let events = st2.events.clone();
@@ -302,7 +356,10 @@ async fn backup_run(State(st): State<AppState>) -> R<opt_drive_core::providers::
         None
     };
 
-    let _lock = st.run_lock.clone().lock_owned().await;
+    // 409 se houver scan/tier em andamento (mesma política dos outros jobs pesados).
+    let _lock = st.run_lock.clone().try_lock_owned().map_err(|_| {
+        AppError::msg(StatusCode::CONFLICT, "uma operação pesada já está em andamento (scan/tier/backup)")
+    })?;
     st.emit(Event::BackupStarted {
         connector: cfg.backup.connector.clone(),
         paths: cfg.backup.paths.len(),
