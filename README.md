@@ -145,13 +145,23 @@ npm run dev     # vite + electron; electron spawns the daemon (target/debug)
 
 - `GET /api/health` · `GET /api/drives`
 - `GET/PUT /api/config`
-- `POST /api/index/run` · `GET /api/index/status`
-- `GET /api/browse?path=<abs>` — lists directories/files with size (hybrid explorer)
+- `POST /api/index/run` · `GET /api/index/status` · `POST /api/index/cancel`
+  (`run` responds immediately with `202 {"started":true}` or `409` when another
+  heavy job is in progress; progress arrives over the WebSocket)
+- `GET /api/browse?path=<abs>` — lists directories/files with size (hybrid explorer);
+  entries carry a `protected` flag for special folders (system/cloud/junction)
 - `GET /api/cleanup/catalog` — cleanup catalog (builtin + custom) for the UI
 - `GET /api/tier/preview` · `POST /api/tier/apply`
 - `POST /api/backup/run` · `GET /api/backup/status` · `POST /api/backup/restore`
 - `GET /api/journals`
-- `WS /api/events` — live scan/tiering/backup progress + `index_updated` (watcher increment)
+- `WS /api/events` — live scan/tiering/backup progress, `index_updated` (watcher
+  increment) and `scan_failed` (terminal event on scan errors)
+
+Drive enumeration is cached (30s TTL) and warmed up at startup — on Windows it
+shells out to PowerShell (`Get-Disk`/`Get-PhysicalDisk`), which takes seconds, so
+`/api/browse` and friends never pay that cost per request. `PUT /api/config`
+restarts the real-time watcher with the new `watch.paths` (no daemon restart
+needed).
 
 ## Configuration (`config.toml`)
 
@@ -175,6 +185,10 @@ debounce_ms = 600                  # burst grouping window (npm install, cargo b
 [cleanup]
 use_default_catalog = true         # built-in catalog (languages + junk)
 # targets = [...]                  # custom additions (see "Cleanup catalog" section)
+
+# Extra paths the app must never move/delete (built-ins — Windows/system folders,
+# cloud-sync folders, junctions — are always protected; see `protected.rs`).
+protected_paths = ["E:\\irreplaceable"]
 
 [[rules]]
 name = "inactive-projects"
@@ -211,6 +225,11 @@ passphrase_env = "OPT_DRIVE_PASSPHRASE"   # passphrase NEVER stored in config
 - [x] **Real-time indexing**: `notify` file watcher applies incremental changes to
   the index (create/modify/remove) without a full re-scan — the explorer and
   tiering stay always up to date.
+- [x] **Protected paths**: system folders (`C:\Windows`, `Program Files`,
+  `$RECYCLE.BIN`, …), system files (`pagefile.sys`, …), cloud-sync folders
+  (`Google Drive`, `OneDrive`, …) and junctions/reparse points are never indexed
+  (system), moved or deleted (all); extra paths via `protected_paths`. The
+  explorer marks them with 🔒.
 - [x] **Phase 2 — backup / multi-connector**: incremental sync with SHA-256
   manifest (`backup_state`) via `BackupProvider` — local mirror, S3-compatible
   (own SigV4, no AWS SDK), Google Drive (OAuth2 loopback + Drive v3 REST) —

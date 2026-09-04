@@ -130,7 +130,8 @@ tiering refletem o disco "agora".
   dir-tree). `notify`/`notify-debouncer-mini` já estavam no workspace mas não eram usados.
 
 ### Próximos passos do watcher
-- [ ] Reiniciar o watcher ao salvar config com paths novos (hoje lê no boot do daemon).
+- [x] Reiniciar o watcher ao salvar config com paths novos (`PUT /api/config` para o
+  watcher antigo via `WatcherHandle` e inicia um novo com a config vigente). ✅
 - [ ] Seed inicial se o DB estiver vazio e `scan_interval = 0` (evitar índice parcial na 1ª run).
 - [ ] `opt-drive watch` na CLI (wiring hoje é só no daemon).
 
@@ -159,6 +160,47 @@ Aba **🗂️ Indexação** no desktop (componente `Index.tsx` + wire no `App.ts
   Electron (dev) spawna de `target/debug`.
 - Dev/teste: `?api=<url>` na query string ou `localStorage.optDrive.apiBase` sobrepõem a
   base URL do daemon (permite rodar o renderer fora do Electron, ex.: contra um stub).
+
+---
+
+## 2.4 Robustez do daemon/UI + caminhos protegidos + gerência de drives ✅
+
+Correções de bugs reportados na prática (explorer não navegava, tiering em
+skeleton eterno) e recursos novos:
+
+- **Cache de enumeração de drives** (30s TTL, aquecido no boot): no Windows a
+  enumeração spawna PowerShell (`Get-Disk`, 1-10s) — `/api/browse` pagava isso a
+  cada clique, e cliques rápidos empilhavam processos (a listagem nunca chegava).
+  Agora `AppState::cached_drives` serve do cache e renova em `spawn_blocking`.
+- **`/api/index/run` como job em background**: responde `started` na hora (antes
+  pendurava a conexão HTTP pelo scan inteiro), responde **409** se outro job
+  pesado roda (antes esperava na fila do `run_lock`), e emite evento terminal em
+  todos os caminhos — novo `scan_failed` (antes erro no meio do scan deixava a UI
+  presa em "Indexando…" para sempre; idem no scheduler).
+- **Tiering estável**: `index_updated` do WS agora throttle de 3s no
+  `refreshKey` (antes cada evento cancelava o fetch do `/api/tier/preview` em
+  andamento — skeleton eterno durante atividade do watcher); fetch com timeout
+  de 30s (AbortSignal) em toda a API; `tierApply` consumia resposta com shape
+  errado (`{report}` vs `RunReport` puro → TypeError após apply bem-sucedido).
+- **Caminhos protegidos** (novo `core::protected`): dirs de sistema na raiz do
+  drive (`Windows`, `Program Files`, `$RECYCLE.BIN`, …), arquivos de sistema
+  (`pagefile.sys`, `ntuser.dat`, …), pastas de cloud-sync (`Google Drive`,
+  `OneDrive`*, `Dropbox`) e reparse points (junctions/symlinks). Guardas em 4
+  pontos: walker (nunca indexa dirs de sistema na raiz — mesmo com
+  `watch.paths=["C:\\"]`), policy (nunca planeja ações neles), executor (recusa
+  com erro no journal) e cleanup (não coleta reparse points). Extras do usuário
+  via `protected_paths` na config. Explorer marca com 🔒.
+- **Paths verbatim normalizados**: `canonicalize()` retorna `\\?\C:\...`, mas as
+  chaves do índice são plain — os tamanhos de pasta do explorer nunca batiam.
+  `browse::normalize_verbatim` corrige (incl. `\\?\UNC\`).
+- **Gerência de drives na aba Drives**: cada card tem toggle **Indexar**
+  (adiciona/remove o mount em `watch.paths`) + chips das subpastas monitoradas
+  (remover individual) + seletor de **tier** (Auto/Rápido/Médio/Arquivo →
+  `config.drives` override). Salvar config reinicia o watcher (ver 2.2).
+- "Indexar agora" do Explorer desabilita durante scan e mostra erros (antes
+  engolia); `atRoot` case-insensitive; check de `..` por componente (aceita
+  `my..folder`).
+- Testes: 50 no total (protected matching, policy skip, verbatim strip).
 
 ---
 
@@ -266,7 +308,7 @@ passphrase_env = "OPT_DRIVE_PASSPHRASE"   # passphrase NUNCA fica na config
 
 ### Comandos úteis
 ```bash
-cargo test                              # 44 testes unitários
+cargo test                              # 50 testes unitários
 cargo clippy --all-targets             # deve estar sem warnings
 cargo run -p opt-drive-cli -- drives   # valida detecção de drives
 cd desktop && npm run dev              # app completo (electron + daemon)
