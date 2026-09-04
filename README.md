@@ -91,6 +91,16 @@ category = "logs"
 ### Prerequisites
 - Rust (stable) and Node.js 18+.
 
+### Quick start (Windows)
+```bat
+run.bat
+```
+One-shot launcher at the repo root: builds the Rust workspace if
+`target\debug\opt-drive-daemon.exe` is missing, runs `npm install` on first
+use, repairs the electron/esbuild postinstalls when Node blocks them, then
+starts the desktop app (vite + electron; electron spawns the daemon as a
+sidecar). Use `run.bat rebuild` to force a `cargo build` first.
+
 ### Rust (core / cli / daemon)
 ```bash
 cargo build          # builds the 3 crates
