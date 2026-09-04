@@ -15,7 +15,7 @@ use clap::{Parser, Subcommand};
 use opt_drive_core::{
     config::Config,
     drives,
-    index::{IndexDb, Indexer},
+    index::IndexDb,
     ops::Executor,
     policy,
     usage::{unix_now, ActivityScorer},
@@ -210,7 +210,7 @@ fn cmd_scan(config_path: &Path, db_path: &Path) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let indexer = Indexer::open(db_path)?;
+    let db = IndexDb::open(db_path)?;
     let cleanup = cfg.cleanup.effective_targets();
     let threads = cfg.indexer.threads;
 
@@ -226,7 +226,7 @@ fn cmd_scan(config_path: &Path, db_path: &Path) -> anyhow::Result<()> {
     pb.enable_steady_tick(std::time::Duration::from_millis(80));
     pb.set_message("indexando…");
 
-    let stats = indexer.scan(
+    let stats = db.scan(
         &cfg.watch.paths,
         &cfg.watch.ignore_globs,
         &cleanup,

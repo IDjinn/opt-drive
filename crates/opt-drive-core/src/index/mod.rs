@@ -35,11 +35,6 @@ pub struct FileEntry {
     pub project_root: Option<String>,
 }
 
-/// Coordenador de indexação: varre raízes e grava no banco em lotes.
-pub struct Indexer {
-    pub db: IndexDb,
-}
-
 /// Estatísticas de uma execução de scan.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ScanStats {
@@ -69,12 +64,13 @@ pub struct ScanProgress {
     pub errors: usize,
 }
 
-impl Indexer {
-    pub fn open(db_path: &Path) -> anyhow::Result<Self> {
-        let db = IndexDb::open(db_path)?;
-        Ok(Self { db })
-    }
-
+/// Indexação em si (varredura e incremental). São métodos de [`IndexDb`] — e não de
+/// um wrapper — para que o daemon compartilhe **uma única conexão de escrita** entre
+/// watcher, scans e backups: em WAL o SQLite só permite um writer por vez, e
+/// conexões concorrentes disputam o lock do banco ("database is locked"). Numa
+/// instância só, os writers fazem fila no `Mutex` da aplicação — sempre succeed, sem
+/// timeout. Leituras podem usar conexões separadas: no WAL leitores não bloqueiam.
+impl IndexDb {
     /// Varre as raízes **em paralelo** (`ignore::WalkParallel`, o motor do ripgrep) e
     /// grava no banco em lotes. `progress` é chamado periodicamente com um
     /// [`ScanProgress`] parcial — entradas, pasta atual, bytes, elapsed — para a UI/CLI
@@ -101,7 +97,7 @@ impl Indexer {
         F: FnMut(&ScanProgress) + Send,
     {
         if roots.is_empty() {
-            let _ = self.db.touch_indexed();
+            let _ = self.touch_indexed();
             return Ok(ScanStats::default());
         }
 
@@ -126,11 +122,11 @@ impl Indexer {
         let projects: Arc<Mutex<HashSet<PathBuf>>> = Arc::new(Mutex::new(HashSet::new()));
         let current_dir: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
         let errors = Arc::new(AtomicUsize::new(0));
-        let total_estimate = self.db.scan_total_estimate();
+        let total_estimate = self.scan_total_estimate();
         let start = Instant::now();
 
         let (entry_tx, entry_rx) = mpsc::channel::<FileEntry>();
-        let db = &self.db;
+        let db = self;
 
         let stats = std::thread::scope(|s| -> anyhow::Result<ScanStats> {
             // --- Collector (thread com escopo): drena o canal, grava no SQLite em lotes,
@@ -338,8 +334,8 @@ impl Indexer {
         })?;
 
         // Marca o timestamp da indexação e grava a estimativa de total p/ o próximo scan/ETA.
-        let _ = self.db.touch_indexed();
-        let _ = self.db.set_scan_total(stats.entries_indexed);
+        let _ = self.touch_indexed();
+        let _ = self.set_scan_total(stats.entries_indexed);
         Ok(stats)
     }
 
@@ -392,7 +388,7 @@ impl Indexer {
 
         let n_up = upserts.len();
         let n_rm = removes.len();
-        self.db.apply_mixed(&upserts, &removes)?;
+        self.apply_mixed(&upserts, &removes)?;
         stats.upserted = n_up;
         stats.removed = n_rm;
         Ok(stats)
@@ -448,7 +444,7 @@ mod tests {
         fs::create_dir_all(root.join("proj")).unwrap();
         fs::write(root.join("proj").join("a.rs"), "x").unwrap();
 
-        let idx = Indexer::open(&root.join("idx.db")).unwrap();
+        let idx = IndexDb::open(&root.join("idx.db")).unwrap();
         let mut batch = ChangeBatch::new();
         batch.push_change(FsChange::upsert(root.join("proj")));
         batch.push_change(FsChange::upsert(root.join("proj").join("a.rs")));
@@ -456,7 +452,7 @@ mod tests {
         let stats = idx.apply_changes(&batch, &[], &rules()).unwrap();
         assert_eq!(stats.upserted, 2);
         assert_eq!(stats.skipped, 0);
-        assert_eq!(idx.db.count(), 2);
+        assert_eq!(idx.count(), 2);
     }
 
     #[test]
@@ -474,7 +470,7 @@ mod tests {
         )
         .unwrap();
 
-        let idx = Indexer::open(&root.join("idx.db")).unwrap();
+        let idx = IndexDb::open(&root.join("idx.db")).unwrap();
         let mut batch = ChangeBatch::new();
         batch.push_change(FsChange::upsert(root.join("proj").join("app.log"))); // junk
         batch.push_change(FsChange::upsert(
@@ -485,14 +481,14 @@ mod tests {
         let stats = idx.apply_changes(&batch, &[], &rules()).unwrap();
         assert_eq!(stats.upserted, 1); // só o marcador node_modules
         assert_eq!(stats.skipped, 2); // *.log + filho de node_modules
-        assert_eq!(idx.db.count(), 1);
+        assert_eq!(idx.count(), 1);
     }
 
     #[test]
     fn apply_changes_removes_file_and_dir_tree() {
         let tmp = tempdir().unwrap();
         let root = tmp.path();
-        let idx = Indexer::open(&root.join("idx.db")).unwrap();
+        let idx = IndexDb::open(&root.join("idx.db")).unwrap();
 
         // Semeia o índice com um projeto + subpasta + arquivos.
         let proj = root.join("proj");
@@ -505,34 +501,34 @@ mod tests {
         seed.push_change(FsChange::upsert(proj.join("sub")));
         seed.push_change(FsChange::upsert(proj.join("sub").join("b.rs")));
         idx.apply_changes(&seed, &[], &rules()).unwrap();
-        assert_eq!(idx.db.count(), 4);
+        assert_eq!(idx.count(), 4);
 
         // Remove só um arquivo.
         let mut rm_file = ChangeBatch::new();
         rm_file.push_change(FsChange::remove(proj.join("a.rs")));
         idx.apply_changes(&rm_file, &[], &rules()).unwrap();
-        assert_eq!(idx.db.count(), 3);
+        assert_eq!(idx.count(), 3);
 
         // Remove a árvore inteira do projeto (dir + descendentes).
         let mut rm_tree = ChangeBatch::new();
         rm_tree.push_change(FsChange::remove(proj.clone()));
         let stats = idx.apply_changes(&rm_tree, &[], &rules()).unwrap();
         assert_eq!(stats.removed, 1);
-        assert_eq!(idx.db.count(), 0);
+        assert_eq!(idx.count(), 0);
     }
 
     #[test]
     fn apply_changes_coalesces_rename() {
         let tmp = tempdir().unwrap();
         let root = tmp.path();
-        let idx = Indexer::open(&root.join("idx.db")).unwrap();
+        let idx = IndexDb::open(&root.join("idx.db")).unwrap();
 
         // Cria old.rs.
         fs::write(root.join("old.rs"), "x").unwrap();
         let mut seed = ChangeBatch::new();
         seed.push_change(FsChange::upsert(root.join("old.rs")));
         idx.apply_changes(&seed, &[], &rules()).unwrap();
-        assert_eq!(idx.db.count(), 1);
+        assert_eq!(idx.count(), 1);
 
         // Rename → remove(old) + create(new), no mesmo batch.
         fs::write(root.join("new.rs"), "x").unwrap();
@@ -542,7 +538,7 @@ mod tests {
         let stats = idx.apply_changes(&rename, &[], &rules()).unwrap();
         assert_eq!(stats.upserted, 1);
         assert_eq!(stats.removed, 1);
-        assert_eq!(idx.db.count(), 1);
+        assert_eq!(idx.count(), 1);
     }
 
     #[test]
@@ -554,12 +550,12 @@ mod tests {
         fs::write(root.join("p").join(".git").join("HEAD"), "x").unwrap();
         fs::write(root.join("p").join("main.rs"), "x").unwrap();
 
-        let idx = Indexer::open(&root.join("idx.db")).unwrap();
+        let idx = IndexDb::open(&root.join("idx.db")).unwrap();
         let mut batch = ChangeBatch::new();
         batch.push_change(FsChange::upsert(root.join("p").join("main.rs")));
         idx.apply_changes(&batch, &[], &rules()).unwrap();
 
-        let entries = idx.db.list_all();
+        let entries = idx.list_all();
         let e = entries.iter().find(|e| e.path.ends_with("main.rs")).unwrap();
         assert!(e.project_root.as_deref().unwrap().ends_with("p"));
     }
@@ -598,7 +594,7 @@ mod tests {
         // Real: scan paralelo (2 threads p/ exercitar o caminho paralelo).
         // DB num tempdir separado p/ não poluir a raiz escaneada com idx.db/-wal/-shm.
         let db_dir = tempdir().unwrap();
-        let idx = Indexer::open(&db_dir.path().join("idx.db")).unwrap();
+        let idx = IndexDb::open(&db_dir.path().join("idx.db")).unwrap();
         let stats = idx
             .scan(
                 &[root.to_path_buf()],
@@ -612,7 +608,7 @@ mod tests {
         assert!(stats.entries_indexed > 0);
 
         let mut actual: Vec<String> =
-            idx.db.list_all().into_iter().map(|e| e.path).collect();
+            idx.list_all().into_iter().map(|e| e.path).collect();
         actual.sort();
         assert_eq!(
             actual, expected,
@@ -620,7 +616,7 @@ mod tests {
         );
 
         // project_root detectado no main.js; node_modules é marcador (podado o conteúdo).
-        let entries = idx.db.list_all();
+        let entries = idx.list_all();
         let main = entries
             .iter()
             .find(|e| e.path.ends_with("main.js"))
@@ -643,7 +639,7 @@ mod tests {
         // total esperado se rodasse até o fim: root + a + a/b + 50 = 53 entradas.
         let cancel = Arc::new(AtomicBool::new(true));
         let db_dir = tempdir().unwrap();
-        let idx = Indexer::open(&db_dir.path().join("idx.db")).unwrap();
+        let idx = IndexDb::open(&db_dir.path().join("idx.db")).unwrap();
         let stats = idx
             .scan(&[root.to_path_buf()], &[], &[], 2, Some(cancel), |_| {})
             .unwrap();

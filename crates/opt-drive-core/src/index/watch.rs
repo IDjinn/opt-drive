@@ -156,7 +156,7 @@ fn inside_cleanup_subtree(path: &Path, rules: &CleanupRules) -> bool {
     false
 }
 
-/// Compila `ignore_globs` num `GlobSet` (reutilizado por [`super::Indexer::apply_changes`]).
+/// Compila `ignore_globs` num `GlobSet` (reutilizado por [`super::IndexDb::apply_changes`]).
 pub(super) fn compile_ignore(globs: &[String]) -> Option<GlobSet> {
     build_globset(globs).ok()
 }

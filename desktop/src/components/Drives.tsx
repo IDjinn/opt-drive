@@ -1,7 +1,7 @@
-import { memo, useCallback, useState } from 'react';
+import { memo, useCallback, useEffect, useState } from 'react';
 import { api, fmtBytes } from '../api';
-import { invalidate, useCached } from '../cache';
-import type { Config, Drive, DriveKind, Tier } from '../types';
+import { invalidate, readCache, useCached, writeCache } from '../cache';
+import type { Config, DirEntry, Drive, DriveKind, Tier } from '../types';
 import Explorer from './Explorer';
 import { DrivesSkeleton, RevalidatingBadge } from './Skeleton';
 
@@ -204,6 +204,22 @@ export default function Drives({ scanning = false }: { scanning?: boolean }) {
   const [sel, setSel] = useState<string | null>(null);
   const [busyMount, setBusyMount] = useState<string | null>(null);
   const [manageErr, setManageErr] = useState<string | null>(null);
+
+  // Raiz de cada drive sempre em cache: o primeiro clique num card pinta o
+  // Explorer na hora, sem skeleton. Falhas silenciosas (daemon offline) — o
+  // Explorer refaz o fetch normal ao navegar.
+  useEffect(() => {
+    if (!drives) return;
+    for (const d of drives) {
+      const key = 'browse:' + d.mount;
+      if (readCache<DirEntry[]>(key) === undefined) {
+        api
+          .browse(d.mount)
+          .then((entries) => writeCache(key, entries))
+          .catch(() => {});
+      }
+    }
+  }, [drives]);
 
   // Salva a config mutada e propaga (cache de config + re-enumera drives, pois
   // tier override muda a classificação).

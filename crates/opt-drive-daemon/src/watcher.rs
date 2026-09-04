@@ -4,7 +4,7 @@
 //! Usa `notify-debouncer-mini`, que coalesce bursts de eventos do filesystem
 //! (`cargo build`/`npm install` tocam milhares de arquivos). O debouncer mini **não**
 //! distingue create/modify/remove (apenas "algo mudou"); portanto marcamos todos os
-//! eventos como `Upsert` e deixamos `Indexer::apply_changes` decidir via `stat`:
+//! eventos como `Upsert` e deixamos `IndexDb::apply_changes` decidir via `stat`:
 //! - path existe agora → (re)indexa;
 //! - path sumiu → remove do índice (+ descendentes).
 //!
@@ -14,9 +14,9 @@
 //! Arquitetura:
 //! - thread própria ("opt-drive-watcher") detém o `Debouncer` (precisa ficar vivo) e
 //!   drena o channel de eventos;
-//! - para cada lote debounced, entrega o trabalho ao runtime tokio via `Handle::spawn`,
-//!   que roda o I/O de DB em `spawn_blocking` (SQLite é síncrono) e emite
-//!   `Event::IndexUpdated`.
+//! - os lotes debounced vão para UM consumidor no runtime tokio, que os aplica em
+//!   ordem (serializados — lotes concorrentes seriam dois writers SQLite brigando
+//!   pelo lock) com o I/O de DB em `spawn_blocking` e emite `Event::IndexUpdated`.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -27,7 +27,7 @@ use notify::RecursiveMode;
 use notify_debouncer_mini::{new_debouncer, DebounceEventResult};
 
 use opt_drive_core::cleanup_catalog::CleanupRules;
-use opt_drive_core::index::{ChangeBatch, ChangeStats, FsChange, Indexer};
+use opt_drive_core::index::{ChangeBatch, ChangeStats, FsChange, IndexDb};
 
 use crate::state::{ChangeStatsDto, Event, AppState};
 
@@ -73,7 +73,9 @@ pub fn start(state: AppState) -> anyhow::Result<Option<WatcherHandle>> {
         CleanupRules::from_targets(&cfg.cleanup.effective_targets())
             .unwrap_or_else(|_| CleanupRules::empty()),
     );
-    let db_path = state.db_path.clone();
+    // Conexão de escrita compartilhada com os demais writers do daemon (scan,
+    // backup) — ver comentário em `AppState::index_db`.
+    let index_db = state.index_db.clone();
     let events = state.events.clone();
     let runtime = tokio::runtime::Handle::try_current()?;
 
@@ -90,7 +92,7 @@ pub fn start(state: AppState) -> anyhow::Result<Option<WatcherHandle>> {
                 debounce_ms,
                 ignore_globs,
                 rules,
-                db_path,
+                index_db,
                 events,
                 runtime,
                 stop,
@@ -106,7 +108,7 @@ fn watcher_loop(
     debounce_ms: u64,
     ignore_globs: Vec<String>,
     rules: Arc<CleanupRules>,
-    db_path: PathBuf,
+    index_db: Arc<IndexDb>,
     events: tokio::sync::broadcast::Sender<Event>,
     runtime: tokio::runtime::Handle,
     stop: Arc<AtomicBool>,
@@ -148,6 +150,56 @@ fn watcher_loop(
     }
     tracing::info!(target: "opt-drive.watch", watched, debounce_ms, "watcher ativo");
 
+    // Consumidor único dos lotes: aplica os incrementos EM SÉRIE na conexão
+    // compartilhada de escrita (junto com scans/backups) — nunca há duas conexões
+    // disputando o lock do SQLite.
+    let (incr_tx, mut incr_rx) = tokio::sync::mpsc::channel::<ChangeBatch>(64);
+    let consumer_ignore = ignore_globs.clone();
+    let consumer_rules = rules.clone();
+    runtime.spawn(async move {
+        // O `incr_tx` morre com a thread do watcher (stop/troca de config): o
+        // consumidor aplica o que já chegou e encerra no `recv` seguinte.
+        while let Some(batch) = incr_rx.recv().await {
+            let n = batch.len();
+            let db = index_db.clone();
+            let ignore = consumer_ignore.clone();
+            let rules = consumer_rules.clone();
+            let res = tokio::task::spawn_blocking(move || -> anyhow::Result<ChangeStats> {
+                let stats = db.apply_changes(&batch, &ignore, &rules)?;
+                let _ = db.touch_indexed();
+                Ok(stats)
+            })
+            .await;
+            match res {
+                Ok(Ok(stats)) => {
+                    if stats.upserted + stats.removed > 0 {
+                        tracing::debug!(
+                            target: "opt-drive.watch",
+                            events = n,
+                            upserted = stats.upserted,
+                            removed = stats.removed,
+                            skipped = stats.skipped,
+                            "incremento aplicado"
+                        );
+                        let _ = events.send(Event::IndexUpdated {
+                            stats: ChangeStatsDto::from(stats),
+                        });
+                    }
+                }
+                Ok(Err(e)) => tracing::warn!(
+                    target: "opt-drive.watch",
+                    error = %e,
+                    "falha ao aplicar incremento"
+                ),
+                Err(e) => tracing::warn!(
+                    target: "opt-drive.watch",
+                    error = %e,
+                    "join do incremento falhou"
+                ),
+            }
+        }
+    });
+
     // O `debouncer` vive nesta thread; o loop abaixo o mantém vivo até receber a
     // ordem de parada (troca de config) ou o processo encerrar. O polling de 500ms
     // no `recv_timeout` é o que permite observar a flag `stop`.
@@ -179,49 +231,15 @@ fn watcher_loop(
             continue;
         }
 
-        let n = batch.len();
-        let ignore = ignore_globs.clone();
-        let rules = rules.clone();
-        let db_path = db_path.clone();
-        let events = events.clone();
-
-        // Entrega o lote ao runtime tokio: o I/O de DB roda em `spawn_blocking`.
-        runtime.spawn(async move {
-            let res = tokio::task::spawn_blocking(move || -> anyhow::Result<ChangeStats> {
-                let indexer = Indexer::open(&db_path)?;
-                let stats = indexer.apply_changes(&batch, &ignore, &rules)?;
-                let _ = indexer.db.touch_indexed();
-                Ok(stats)
-            })
-            .await;
-            match res {
-                Ok(Ok(stats)) => {
-                    if stats.upserted + stats.removed > 0 {
-                        tracing::debug!(
-                            target: "opt-drive.watch",
-                            events = n,
-                            upserted = stats.upserted,
-                            removed = stats.removed,
-                            skipped = stats.skipped,
-                            "incremento aplicado"
-                        );
-                        let _ = events.send(Event::IndexUpdated {
-                            stats: ChangeStatsDto::from(stats),
-                        });
-                    }
-                }
-                Ok(Err(e)) => tracing::warn!(
-                    target: "opt-drive.watch",
-                    error = %e,
-                    "falha ao aplicar incremento"
-                ),
-                Err(e) => tracing::warn!(
-                    target: "opt-drive.watch",
-                    error = %e,
-                    "join do incremento falhou"
-                ),
-            }
-        });
+        // Entrega ao consumidor (bloqueia se ele estiver aplicando vários lotes —
+        // backpressure natural; o debouncer bufferiza enquanto isso).
+        if incr_tx.blocking_send(batch).is_err() {
+            tracing::warn!(
+                target: "opt-drive.watch",
+                "consumidor de incrementos encerrou — watcher inativo"
+            );
+            break;
+        }
     }
 
     tracing::info!(target: "opt-drive.watch", "watcher encerrado");

@@ -17,7 +17,15 @@ pub struct IndexDb {
 impl IndexDb {
     pub fn open(path: &Path) -> anyhow::Result<Self> {
         let conn = Connection::open(path)?;
-        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")?;
+        // Várias conexões escrevem concorrentemente (watcher, scan completo,
+        // backup): em WAL só há um writer por vez e, sem `busy_timeout`, quem
+        // chega segundo recebe SQLITE_BUSY imediato ("database is locked").
+        // 5s cobre com folga os lotes de 2k entradas do scan.
+        conn.execute_batch(
+            "PRAGMA journal_mode=WAL; \
+             PRAGMA synchronous=NORMAL; \
+             PRAGMA busy_timeout=5000;",
+        )?;
         conn.execute_batch(SCHEMA)?;
         Ok(Self {
             conn: Mutex::new(conn),
@@ -91,8 +99,7 @@ impl IndexDb {
             }
             let mut rm = tx.prepare_cached(SQL_DELETE_TREE)?;
             for p in removes {
-                let pat = descendants_pattern(p);
-                rm.execute(params![p, pat])?;
+                rm.execute(params![p, subtree_upper_bound(p)])?;
             }
         }
         tx.commit()?;
@@ -103,8 +110,7 @@ impl IndexDb {
     /// apagadas. Retorna `Ok(0)` se o path não estava indexado.
     pub fn remove_tree(&self, path: &str) -> anyhow::Result<usize> {
         let conn = self.conn.lock().unwrap();
-        let pat = descendants_pattern(path);
-        let n = conn.execute(SQL_DELETE_TREE, params![path, pat])?;
+        let n = conn.execute(SQL_DELETE_TREE, params![path, subtree_upper_bound(path)])?;
         Ok(n)
     }
 
@@ -254,15 +260,21 @@ impl IndexDb {
     /// dir, se houver linha). Retorna `None` quando nenhuma entrada casa — sinal de que
     /// o diretório não foi indexado (quem chamou deve calcular ao vivo).
     ///
-    /// O `LIKE` escapa `\`, `%` e `_` para não haver falsos positivos por causa de
-    /// caracteres curinga em nomes reais (ex.: `my_file`).
+    /// Usa um **range scan na primary key** (`path >= ? AND path < ?`) em vez de
+    /// `LIKE`: o índice de `path` tem collation BINARY, então o `LIKE`
+    /// (case-insensitive) nunca o aproveita e cada consulta varria a tabela INTEIRA —
+    /// num índice de milhões de entradas, listar a raiz de um drive (dezenas de
+    /// pastas × scan completo) estourava o timeout de 30s da UI. O range toca só as
+    /// linhas da subárvore. Contrapartida: a comparação é case-sensitive — se o caso
+    /// de uma pasta mudou desde o último scan, o tamanho fica "—" até re-indexar (o
+    /// watcher corrige sozinho num rename).
     pub fn dir_size(&self, path: &str) -> Option<u64> {
         let conn = self.conn.lock().unwrap();
-        let pattern = descendants_pattern(path);
+        let hi = subtree_upper_bound(path);
         let total: Option<i64> = conn
             .query_row(
-                "SELECT SUM(size) FROM files WHERE path = ?1 OR path LIKE ?2 ESCAPE '\\'",
-                params![path, pattern],
+                "SELECT SUM(size) FROM files WHERE path >= ?1 AND path < ?2",
+                params![path, hi],
                 |r| r.get::<_, Option<i64>>(0),
             )
             .ok()
@@ -318,20 +330,12 @@ fn unix_now() -> i64 {
         .unwrap_or(0)
 }
 
-/// Escapa `\`, `%` e `_` para uso num `LIKE … ESCAPE '\'`. Evita falsos positivos por
-/// causa de curingas em nomes reais (ex.: `my_file`, `data%`).
-fn escape_like(path: &str) -> String {
-    path.replace('\\', r"\\")
-        .replace('%', r"\%")
-        .replace('_', r"\_")
-}
-
-/// Pattern `LIKE` que casa `path` exato OU qualquer descendente
-/// (`path\...`). Usa `ESCAPE '\'` — o separador e as barras do próprio path são
-/// escapados por [`escape_like`].
-fn descendants_pattern(path: &str) -> String {
-    // separador (backslash escapado p/ LIKE) + curinga % (qualquer descendente).
-    format!("{}\\\\%", escape_like(path))
+/// Limite superior (exclusivo) do range que casa `path` e todos os descendentes:
+/// `path` + U+10FFFF (maior codepoint UTF-8). Na comparação byte a byte (BINARY)
+/// do índice de `path`, toda linha `path\...` é menor que isso — permite range
+/// scan indexado em vez do `LIKE`, que varria a tabela inteira.
+fn subtree_upper_bound(path: &str) -> String {
+    format!("{path}\u{10FFFF}")
 }
 
 const SCHEMA: &str = r#"
@@ -374,9 +378,9 @@ ON CONFLICT(path) DO UPDATE SET
     last_indexed=excluded.last_indexed
 "#;
 
-/// Apaga um path e seus descendentes. `?2` é um pattern `LIKE` com `ESCAPE '\'`
-/// (construído por [`descendants_pattern`]).
-const SQL_DELETE_TREE: &str = r#"DELETE FROM files WHERE path = ?1 OR path LIKE ?2 ESCAPE '\'"#;
+/// Apaga um path e seus descendentes. `?2` é o limite superior do range
+/// (construído por [`subtree_upper_bound`]) — range scan indexado na PK.
+const SQL_DELETE_TREE: &str = r#"DELETE FROM files WHERE path >= ?1 AND path < ?2"#;
 
 #[cfg(test)]
 mod tests {
@@ -422,6 +426,56 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(db.dir_size("C:\\my_proj"), Some(10));
+    }
+
+    #[test]
+    fn busy_timeout_espera_writer_concorrente() {
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("idx.db");
+        let db = IndexDb::open(&path).unwrap();
+
+        // Outra conexão segura o write lock (BEGIN IMMEDIATE) por 300ms.
+        let holder = std::thread::spawn(move || {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch("PRAGMA journal_mode=WAL; BEGIN IMMEDIATE;").unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            let _ = conn.execute_batch("COMMIT;");
+        });
+        std::thread::sleep(std::time::Duration::from_millis(50)); // lock já tomado
+
+        // Sem busy_timeout isto falharia na hora com "database is locked".
+        db.upsert(&file("C:\\a.txt", 1)).unwrap();
+        holder.join().unwrap();
+        assert_eq!(db.count(), 1);
+    }
+
+    /// Bench manual do `dir_size` (range scan na PK):
+    /// `cargo test -p opt-drive-core --release bench_dir_size -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn bench_dir_size() {
+        let tmp = tempdir().unwrap();
+        let db = IndexDb::open(&tmp.path().join("idx.db")).unwrap();
+        // 500k entradas: 50 pastas × 10k arquivos (lotes de 2k, como o scan).
+        let mut all = Vec::new();
+        for d in 0..50 {
+            for f in 0..10_000 {
+                all.push(file(&format!("C:\\pastas\\p{d:02}\\f{f}.txt"), 10));
+            }
+        }
+        for chunk in all.chunks(2000) {
+            db.upsert_many(chunk).unwrap();
+        }
+
+        let t = std::time::Instant::now();
+        assert_eq!(db.dir_size("C:\\pastas\\p07"), Some(100_000));
+        println!("dir_size de UMA subpasta (10k/500k linhas): {:?}", t.elapsed());
+
+        let t = std::time::Instant::now();
+        assert_eq!(db.dir_size("C:\\pastas"), Some(5_000_000));
+        println!("dir_size da RAIZ (todas as 500k linhas):    {:?}", t.elapsed());
+
+        assert_eq!(db.dir_size("C:\\naoexiste"), None);
     }
 
     #[test]

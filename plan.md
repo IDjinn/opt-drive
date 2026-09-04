@@ -204,6 +204,49 @@ skeleton eterno) e recursos novos:
 
 ---
 
+## 2.5 Lock do SQLite + cache da raiz dos drives ✅
+
+- **"database is locked" nos incrementos** (logs do watcher), versão final: o daemon
+  agora mantém **uma única conexão de escrita** (`AppState::index_db:
+  Arc<IndexDb>`) compartilhada por TODOS os writers — watcher, `/api/index/run`,
+  scheduler de scan (1h) e schedulers/handlers de backup. Como o lock de escrita
+  do SQLite é por banco e só é disputado entre **conexões** concorrentes, uma
+  conexão única o torna estruturalmente impossível dentro do processo: os writers
+  fazem fila no `Mutex` interno, sem timeout e sem perder lotes. Para tanto,
+  `scan`/`apply_changes` migraram do wrapper `Indexer` para métodos de `IndexDb`
+  (o wrapper foi removido; CLI e testes atualizados). Leituras (browse, status,
+  tier preview) continuam abrindo conexões próprias por request — em WAL,
+  leitores nunca bloqueiam writers.
+- Defesas anteriores mantidas: `PRAGMA busy_timeout=5000` em `IndexDb::open`
+  (cobre o caso multi-processo: CLI rodando junto do daemon) + teste
+  `busy_timeout_espera_writer_concorrente`; watcher com consumidor único
+  (`tokio::mpsc`) que aplica lotes debounced em série (antes: um spawn por lote,
+  cada um com conexão própria).
+- **Smoke test manual**: watcher ativo + burst de 900+ criações/remoções + dois
+  scans completos concorrentes → 0 ocorrências de "database is locked", 0 WARNs,
+  índice consistente (contagem bateu com o estado final do disco).
+- **Timeout de 30s no `/api/browse`** (apareceu depois que o índice passou a cobrir
+  drives inteiros): `dir_size` consultava com `LIKE 'path\%'`, que é
+  case-insensitive e portanto **nunca usava o índice da PK** — cada pasta listada
+  custava um scan completo da tabela; a raiz de um drive (dezenas de pastas ×
+  milhões de linhas) estourava o timeout do frontend (e o prefetch da raiz dos
+  drives disparava isso pra todos os drives no boot). Reescrito como **range scan
+  indexado** (`path >= ? AND path < path+\u{10FFFF}`), que toca só as linhas da
+  subárvore; `SQL_DELETE_TREE` (remove_tree/apply_mixed) recebeu o mesmo
+  tratamento. Bench (release, 500k linhas): subpasta 2,4ms · raiz 117ms. Smoke:
+  browse ≤5ms com scan completo + churn simultâneos. Contrapartida aceita: a
+  comparação agora é case-sensitive — pasta renomeada só em caso volta a ter
+  tamanho após o próximo incremento/scan.
+- Nota de launch: o Electron spawna `target/debug/opt-drive-daemon.exe` **sem
+  rebuild** — depois de mudanças no Rust, rodar `cargo build -p opt-drive-daemon`
+  (ou `run.bat`) antes de reiniciar o app, senão o binário antigo roda.
+- **Raiz dos drives sempre em cache no desktop**: `Drives` semeia
+  `browse:<mount>` no cache in-memory quando a lista de drives chega — o primeiro
+  clique num card pinta o Explorer na hora, sem skeleton de primeiro acesso.
+  Testes: 51 no total.
+
+---
+
 ## 3. Fase 2 — Backup / Sync multi-conector + Encriptação ✅
 
 Objetivo: backup/sync incremental de pastas selecionadas, com restore, múltiplos

@@ -112,18 +112,13 @@ async fn run_scan(
     cancel: Arc<AtomicBool>,
 ) {
     // Estimativa de total (do último scan) — permite à UI desenhar a barra imediatamente.
-    let db_path_for_est = st.db_path.clone();
-    let total_estimate = match spawn_blocking(move || -> anyhow::Result<Option<usize>> {
-        Ok(IndexDb::open(&db_path_for_est)?.scan_total_estimate())
+    // (Leitura pura; falha de join só deixa sem estimativa.)
+    let db_for_est = st.index_db.clone();
+    let total_estimate = spawn_blocking(move || -> anyhow::Result<Option<usize>> {
+        Ok(db_for_est.scan_total_estimate())
     })
     .await
-    {
-        Ok(n) => n,
-        Err(e) => {
-            finish_scan(&st, &cancel, ScanEnd::Failed(e.msg));
-            return;
-        }
-    };
+    .unwrap_or(None);
     st.emit(Event::ScanStarted { total_estimate });
 
     let threads = cfg.indexer.threads;
@@ -131,13 +126,12 @@ async fn run_scan(
     let paths = cfg.watch.paths.clone();
     let globs = cfg.watch.ignore_globs.clone();
     let cleanup = cfg.cleanup.effective_targets();
-    let db_path = st.db_path.clone();
+    let db = st.index_db.clone();
     let cancel_for_task = cancel.clone();
 
     let join = tokio::task::spawn_blocking(
         move || -> anyhow::Result<opt_drive_core::index::ScanStats> {
-            let indexer = opt_drive_core::index::Indexer::open(&db_path)?;
-            indexer.scan(&paths, &globs, &cleanup, threads, Some(cancel_for_task), |p| {
+            db.scan(&paths, &globs, &cleanup, threads, Some(cancel_for_task), |p| {
                 let _ = events.send(Event::ScanProgress {
                     indexed: p.indexed,
                     current_dir: p.current_dir.clone(),
@@ -369,7 +363,7 @@ async fn backup_run(State(st): State<AppState>) -> R<opt_drive_core::providers::
     let backup = cfg.backup.clone();
     let report = spawn_blocking(move || -> anyhow::Result<opt_drive_core::providers::SyncReport> {
         let provider = opt_drive_connectors::connector_from_config(&backup)?;
-        let db = IndexDb::open(&st2.db_path)?;
+        let db = st2.index_db.clone();
         let events = st2.events.clone();
 
         let mut total = opt_drive_core::providers::SyncReport::default();
@@ -451,9 +445,9 @@ async fn backup_restore(
     let backup = cfg.backup.clone();
     let dst = PathBuf::from(&body.dst);
     let remote_id = body.remote_id.clone();
+    let db = st.index_db.clone();
     spawn_blocking(move || -> anyhow::Result<()> {
         let provider = opt_drive_connectors::connector_from_config(&backup)?;
-        let db = IndexDb::open(&st.db_path)?;
         let ctx = opt_drive_core::providers::sync::SyncContext {
             db: &db,
             delete_remote: false,

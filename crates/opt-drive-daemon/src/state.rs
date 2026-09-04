@@ -10,6 +10,7 @@ use tokio::sync::{broadcast, Mutex as AsyncMutex};
 
 use opt_drive_core::config::Config;
 use opt_drive_core::drives::Drive;
+use opt_drive_core::index::IndexDb;
 use opt_drive_core::ops::RunReport;
 use opt_drive_core::policy::Plan;
 
@@ -99,6 +100,12 @@ type DrivesCache = Option<(Instant, Vec<Drive>)>;
 pub struct AppState {
     pub config_path: PathBuf,
     pub db_path: PathBuf,
+    /// Conexão de **escrita** compartilhada por todos os writers do daemon
+    /// (watcher, scans, backups). Uma só conexão = zero disputa de lock SQLite
+    /// dentro do processo ("database is locked" fica estruturalmente impossível —
+    /// os writers fazem fila no `Mutex` interno). Leituras podem abrir conexões
+    /// próprias: em WAL, leitores nunca bloqueiam writers.
+    pub index_db: Arc<IndexDb>,
     pub events: broadcast::Sender<Event>,
     /// Mutex para serializar operações pesadas (scan/tier) — evita concorrência
     /// sobre o SQLite e disks.
@@ -116,17 +123,24 @@ pub struct AppState {
 }
 
 impl AppState {
-    pub fn new(config_path: PathBuf, db_path: PathBuf) -> Self {
+    pub fn new(config_path: PathBuf, db_path: PathBuf) -> anyhow::Result<Self> {
         let (events, _) = broadcast::channel(256);
-        Self {
+        // Garante o diretório do banco (um `--db` custom pode apontar p/ pasta
+        // inexistente) e abre a conexão de escrita compartilhada.
+        if let Some(parent) = db_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let index_db = Arc::new(IndexDb::open(&db_path)?);
+        Ok(Self {
             config_path,
             db_path,
+            index_db,
             events,
             run_lock: Arc::new(AsyncMutex::new(())),
             scan_cancel: Arc::new(Mutex::new(None)),
             drives_cache: Arc::new(AsyncMutex::new(None)),
             watcher: Arc::new(Mutex::new(None)),
-        }
+        })
     }
 
     /// Carrega a config atual (relê do disco a cada chamada).

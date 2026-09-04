@@ -62,7 +62,7 @@ async fn main() -> anyhow::Result<()> {
     // Garante config e DB iniciais.
     let _ = Config::load_or_create(&config_path)?;
 
-    let state = AppState::new(config_path.clone(), db_path.clone());
+    let state = AppState::new(config_path.clone(), db_path.clone())?;
 
     // Pré-aquece o cache de drives (PowerShell demora segundos; sem isto o 1º
     // browse da UI paga o custo).
@@ -135,11 +135,10 @@ async fn scheduler(state: AppState, interval: Duration) {
             let globs = cfg.watch.ignore_globs.clone();
             let cleanup = cfg.cleanup.effective_targets();
             let threads = cfg.indexer.threads;
-            let db_path = state.db_path.clone();
+            let db = state.index_db.clone();
             state.emit(state::Event::ScanStarted { total_estimate: None });
             let res = tokio::task::spawn_blocking(move || -> anyhow::Result<state::ScanStatsDto> {
-                let indexer = opt_drive_core::index::Indexer::open(&db_path)?;
-                let stats = indexer.scan(&paths, &globs, &cleanup, threads, None, |p| {
+                let stats = db.scan(&paths, &globs, &cleanup, threads, None, |p| {
                     let _ = events.send(state::Event::ScanProgress {
                         indexed: p.indexed,
                         current_dir: p.current_dir.clone(),
@@ -207,11 +206,10 @@ async fn backup_scheduler(state: AppState) {
             });
             let events = state.events.clone();
             let backup = cfg.backup.clone();
-            let db_path = state.db_path.clone();
+            let db = state.index_db.clone();
             let res = tokio::task::spawn_blocking(
                 move || -> anyhow::Result<opt_drive_core::providers::SyncReport> {
                     let provider = opt_drive_connectors::connector_from_config(&backup)?;
-                    let db = opt_drive_core::index::IndexDb::open(&db_path)?;
                     let mut total = opt_drive_core::providers::SyncReport::default();
                     for path in &backup.paths {
                         let ctx = opt_drive_core::providers::sync::SyncContext {
